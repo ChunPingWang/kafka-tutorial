@@ -1,0 +1,108 @@
+# =============================================================================
+# Kafka broker 設定範本（KRaft 模式，Kafka 4.x）
+# 由 scripts/install/install-kafka.sh 以實際值替換 @@...@@ 佔位符後產生。
+# 每個參數的意義請見 README.md「設定參數詳解」。
+# =============================================================================
+
+############################# 節點身分 #############################
+# 這個節點扮演的角色：
+#   broker            = 只處理資料（大型叢集建議）
+#   controller        = 只處理 metadata quorum（大型叢集建議）
+#   broker,controller = 合併模式（開發／小型叢集）
+process.roles=@@PROCESS_ROLES@@
+
+# 叢集內唯一的整數 ID，一旦格式化就不可更改
+node.id=@@NODE_ID@@
+
+# controller quorum 成員清單：<node.id>@<host>:<controller_port>
+# 必須是奇數個（1 / 3 / 5），才能形成多數決
+controller.quorum.voters=@@CONTROLLER_QUORUM_VOTERS@@
+
+############################# 網路監聽 #############################
+# 本機實際綁定的位址
+listeners=@@LISTENERS@@
+
+# 對外公告給 client 的位址：client 拿到這個值之後會直接連線，
+# 因此在 Docker / K8s / NAT 環境中設錯這裡是最常見的「連得上又用不了」原因
+advertised.listeners=@@ADVERTISED_LISTENERS@@
+
+# controller 專用的 listener 名稱（不會公告給一般 client）
+controller.listener.names=CONTROLLER
+
+# listener 名稱 -> 安全協定 的對應表
+listener.security.protocol.map=@@LISTENER_SECURITY_PROTOCOL_MAP@@
+
+# broker 之間互連使用的 listener
+inter.broker.listener.name=@@INTER_BROKER_LISTENER_NAME@@
+
+############################# 執行緒與網路 #############################
+# 處理網路收送的執行緒數，約等於 CPU 核心數
+num.network.threads=@@NUM_NETWORK_THREADS@@
+# 處理磁碟 I/O 的執行緒數，建議 = 磁碟數 x 2 起跳
+num.io.threads=@@NUM_IO_THREADS@@
+socket.send.buffer.bytes=102400
+socket.receive.buffer.bytes=102400
+# 單一請求上限（100 MB），避免惡意或異常的巨大請求撐爆記憶體
+socket.request.max.bytes=104857600
+
+############################# 儲存 #############################
+# 資料目錄。多顆磁碟就用逗號分隔多個目錄（Kafka 會自行分散 partition），
+# 千萬不要放在 NFS 或網路磁碟上。
+log.dirs=@@LOG_DIRS@@
+
+# 建立 topic 時的預設 partition 數
+num.partitions=@@NUM_PARTITIONS@@
+
+# 啟動與關閉時每個資料目錄用幾條執行緒復原 log
+num.recovery.threads.per.data.dir=2
+
+############################# 內部 topic 副本 #############################
+# 正式環境務必 >= 3；單機開發才設 1
+offsets.topic.replication.factor=@@INTERNAL_RF@@
+transaction.state.log.replication.factor=@@INTERNAL_RF@@
+transaction.state.log.min.isr=@@INTERNAL_MIN_ISR@@
+share.coordinator.state.topic.replication.factor=@@INTERNAL_RF@@
+share.coordinator.state.topic.min.isr=@@INTERNAL_MIN_ISR@@
+
+############################# 預設可靠性 #############################
+# 新建 topic 的預設副本數
+default.replication.factor=@@DEFAULT_RF@@
+# acks=all 時，至少要幾個副本寫入成功才算成功
+min.insync.replicas=@@MIN_ISR@@
+# false = 不允許落後的副本當上 leader（寧可停止服務也不遺失資料）
+unclean.leader.election.enable=false
+# 自動建立 topic：正式環境一律關閉，避免打錯字就生出一個 topic
+auto.create.topics.enable=@@AUTO_CREATE_TOPICS@@
+# 允許刪除 topic
+delete.topic.enable=true
+
+############################# 資料保留 #############################
+# 訊息保留時間（小時）。168 = 7 天
+log.retention.hours=@@RETENTION_HOURS@@
+# 每個 partition 的保留大小上限，-1 表示不限制（只看時間）
+log.retention.bytes=-1
+# 單一 segment 檔案大小；segment 寫滿或超時才會被輪替，之後才可能被刪除
+log.segment.bytes=1073741824
+# 檢查是否有可刪除 segment 的間隔（毫秒）
+log.retention.check.interval.ms=300000
+
+############################# 刷寫策略 #############################
+# 預設交給 OS page cache 決定何時落盤（效能最佳），
+# 靠 replication（acks=all + min.insync.replicas>=2）而不是 fsync 來保證持久性。
+# 除非有明確需求，否則不要開啟下面兩行。
+#log.flush.interval.messages=10000
+#log.flush.interval.ms=1000
+
+############################# Group 協調 #############################
+# 新 consumer 加入時延遲 rebalance 的時間，避免啟動時連續 rebalance
+group.initial.rebalance.delay.ms=@@GROUP_INITIAL_REBALANCE_DELAY@@
+
+############################# 壓縮 #############################
+# producer = 保留 producer 端的壓縮格式，不在 broker 重壓（省 CPU）
+compression.type=producer
+
+############################# 自動平衡 #############################
+# 定期把 leader 換回 preferred replica，避免流量集中在少數 broker
+auto.leader.rebalance.enable=true
+leader.imbalance.check.interval.seconds=300
+leader.imbalance.per.broker.percentage=10

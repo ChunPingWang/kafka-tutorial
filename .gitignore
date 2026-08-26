@@ -1,0 +1,22 @@
+# 環境相依設定（由 conf/kafka-env.sh.example 複製而來）
+conf/kafka-env.sh
+
+# 安全性檔案：絕對不要進版控
+conf/security/*.properties
+conf/security/*.jks
+conf/security/*.p12
+conf/security/*.pem
+conf/security/*.key
+conf/security/*.crt
+conf/security/*.jaas
+!conf/security/*.example
+
+# 執行期產物
+*.log
+logs/
+data/
+backups/
+downloads/
+*.tgz
+*.tar.gz
+.tmp/
