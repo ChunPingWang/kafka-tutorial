@@ -193,7 +193,8 @@ kafka_topics()    { run "$(kafka_bin kafka-topics.sh)"           --bootstrap-ser
 kafka_configs()   { run "$(kafka_bin kafka-configs.sh)"          --bootstrap-server "${BOOTSTRAP_SERVERS}" $(_cmd_config_args) "$@"; }
 kafka_groups()    { run "$(kafka_bin kafka-consumer-groups.sh)"  --bootstrap-server "${BOOTSTRAP_SERVERS}" $(_cmd_config_args) "$@"; }
 kafka_acls()      { run "$(kafka_bin kafka-acls.sh)"             --bootstrap-server "${BOOTSTRAP_SERVERS}" $(_cmd_config_args) "$@"; }
-kafka_cluster()   { run "$(kafka_bin kafka-cluster.sh)"          --bootstrap-server "${BOOTSTRAP_SERVERS}" $(_cmd_config_args) "$@"; }
+# kafka-cluster.sh 要求「子指令在前」，因此單獨包裝
+kafka_cluster()   { local sub="$1"; shift; run "$(kafka_bin kafka-cluster.sh)" "${sub}" --bootstrap-server "${BOOTSTRAP_SERVERS}" $(_cmd_config_args) "$@"; }
 kafka_metadata()  { run "$(kafka_bin kafka-metadata-quorum.sh)"  --bootstrap-server "${BOOTSTRAP_SERVERS}" $(_cmd_config_args) "$@"; }
 kafka_logdirs()   { run "$(kafka_bin kafka-log-dirs.sh)"         --bootstrap-server "${BOOTSTRAP_SERVERS}" $(_cmd_config_args) "$@"; }
 

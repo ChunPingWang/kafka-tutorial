@@ -12,6 +12,9 @@
 #   --voters LIST           controller quorum，例：1@k1:9093,2@k2:9093,3@k3:9093
 #   --roles ROLES           process.roles，預設 broker,controller
 #   --advertised-host HOST  對外公告的主機名稱／IP（預設 localhost）
+#   --broker-port N         broker listener port（預設 9092）
+#   --controller-port N     controller listener port（預設 9093）
+#   --jmx-port N            JMX port（預設 9999；同機多 broker 必須錯開）
 #   --version X.Y.Z         Kafka 版本（預設 ${KAFKA_VERSION}）
 #   --cluster-id ID         既有叢集的 cluster id（加入既有叢集時必填）
 #   --skip-verify           跳過 SHA512 校驗（不建議）
@@ -50,6 +53,9 @@ while [[ $# -gt 0 ]]; do
     --voters)           VOTERS="$2"; shift 2 ;;
     --roles)            ROLES="$2"; shift 2 ;;
     --advertised-host)  ADV_HOST="$2"; shift 2 ;;
+    --broker-port)      BROKER_PORT="$2"; shift 2 ;;
+    --controller-port)  CONTROLLER_PORT="$2"; shift 2 ;;
+    --jmx-port)         JMX_PORT="$2"; shift 2 ;;
     --version)          KAFKA_VERSION="$2"; KAFKA_DIST="kafka_${SCALA_VERSION}-${KAFKA_VERSION}"; shift 2 ;;
     --cluster-id)       CLUSTER_ID="$2"; shift 2 ;;
     --skip-verify)      SKIP_VERIFY=true; shift ;;
@@ -65,6 +71,9 @@ done
 # -----------------------------------------------------------------------------
 BROKER_PORT="${BROKER_PORT:-9092}"
 CONTROLLER_PORT="${CONTROLLER_PORT:-9093}"
+# JMX 供監控（Prometheus JMX exporter / jconsole）使用；
+# 同一台機器要跑多個 broker 時務必錯開。
+JMX_PORT="${JMX_PORT:-9999}"
 
 case "${MODE}" in
   single)
@@ -113,6 +122,7 @@ cat >&2 <<EOF
   advertised host   : ${ADV_HOST}
   安裝目錄          : ${KAFKA_BASE_DIR}
   資料目錄          : ${KAFKA_DATA_DIR}
+  broker/controller : ${BROKER_PORT} / ${CONTROLLER_PORT}   JMX: ${JMX_PORT}
   設定檔            : ${KAFKA_CONF_DIR}/server.properties
 EOF
 
@@ -277,7 +287,7 @@ set -Eeuo pipefail
 export KAFKA_HEAP_OPTS="\${KAFKA_HEAP_OPTS:-${KAFKA_HEAP_OPTS}}"
 export LOG_DIR="${KAFKA_LOG_DIR}"
 # JMX：監控與 kafka-run-class 工具會用到
-export JMX_PORT="\${JMX_PORT:-9999}"
+export JMX_PORT="\${JMX_PORT:-${JMX_PORT}}"
 exec "${KAFKA_HOME}/bin/kafka-server-start.sh" "\$@" "${SERVER_PROPS}"
 EOF
   cat > "${KAFKA_BASE_DIR}/stop.sh" <<EOF
