@@ -93,7 +93,7 @@ if [[ -f "${TARGET_PATH}/manifest.txt" ]]; then
   fi
 
   # topic 數量對得起來嗎
-  ACTUAL_TOPICS="$(grep -vc '^__' "${TARGET_PATH}/topics/topic-list.txt" 2>/dev/null || echo 0)"
+  ACTUAL_TOPICS="$(grep -vc '^__' "${TARGET_PATH}/topics/topic-list.txt" 2>/dev/null || true)"
   if [[ "${ACTUAL_TOPICS}" == "${M_topic_count:-}" ]]; then
     ok "topic 數量與 manifest 一致（${ACTUAL_TOPICS}）"
   else

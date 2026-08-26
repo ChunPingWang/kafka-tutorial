@@ -1,0 +1,66 @@
+# =============================================================================
+# systemd unit 範本（正式環境建議用這個管理 Kafka，而不是 nohup）
+#
+# 安裝：
+#   sed -e 's|@@KAFKA_HOME@@|/opt/kafka/current|g' \
+#       -e 's|@@KAFKA_CONF@@|/opt/kafka/conf/server.properties|g' \
+#       -e 's|@@KAFKA_LOG_DIR@@|/var/log/kafka|g' \
+#       -e 's|@@KAFKA_USER@@|kafka|g' \
+#       -e 's|@@HEAP@@|-Xmx6G -Xms6G|g' \
+#       conf/templates/kafka.service.tmpl | sudo tee /etc/systemd/system/kafka.service
+#   sudo systemctl daemon-reload && sudo systemctl enable --now kafka
+# =============================================================================
+[Unit]
+Description=Apache Kafka Broker (KRaft)
+Documentation=https://kafka.apache.org/documentation/
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=@@KAFKA_USER@@
+Group=@@KAFKA_USER@@
+
+Environment="KAFKA_HEAP_OPTS=@@HEAP@@"
+Environment="LOG_DIR=@@KAFKA_LOG_DIR@@"
+Environment="JMX_PORT=9999"
+# G1GC 是 Kafka 官方預設，MaxGCPauseMillis 壓低 stop-the-world 對 p99 的影響
+Environment="KAFKA_JVM_PERFORMANCE_OPTS=-server -XX:+UseG1GC -XX:MaxGCPauseMillis=20 -XX:InitiatingHeapOccupancyPercent=35 -XX:+ExplicitGCInvokesConcurrent -Djava.awt.headless=true"
+
+ExecStart=@@KAFKA_HOME@@/bin/kafka-server-start.sh @@KAFKA_CONF@@
+ExecStop=@@KAFKA_HOME@@/bin/kafka-server-stop.sh
+
+# --- 關機行為（最重要的三行）---
+# Kafka 關機時要把 leader 交接出去、把 log 索引寫完整，急不得。
+# TimeoutStopSec 設太短會變成 SIGKILL，下次啟動要做冗長的 log recovery。
+KillSignal=SIGTERM
+TimeoutStopSec=300
+SendSIGKILL=no
+
+# --- 重啟策略 ---
+Restart=on-failure
+RestartSec=15
+# 短時間內反覆失敗就別再自動重啟了，讓人介入看問題
+StartLimitBurst=3
+StartLimitIntervalSec=600
+
+# --- 資源限制 ---
+# Kafka 每個 partition 至少 2 個檔案描述符，加上每條連線 1 個，很容易破萬
+LimitNOFILE=1048576
+LimitNPROC=65536
+# 不要讓 broker 被換出到 swap
+LimitMEMLOCK=infinity
+
+# --- OOM ---
+# 寧可讓別的行程先被殺，也不要殺 broker
+OOMScoreAdjust=-500
+
+# --- 安全性強化 ---
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+ReadWritePaths=@@KAFKA_LOG_DIR@@ /var/lib/kafka
+
+[Install]
+WantedBy=multi-user.target

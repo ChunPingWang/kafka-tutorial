@@ -1,0 +1,86 @@
+# =============================================================================
+# 災難備援演練環境：兩座獨立叢集 + MirrorMaker 2
+#
+# 用來練習：跨叢集複寫、量測 RPO、執行 failover、failback。
+#
+# 啟動：
+#   docker compose -f docker/docker-compose.dr.yml up -d
+#
+# 主叢集   -> localhost:19092  （別名 dc1）
+# 備援叢集 -> localhost:29092  （別名 dc2）
+#
+# 演練：
+#   BOOTSTRAP_SERVERS=localhost:19092 ./scripts/test/smoke-test.sh
+#   ./scripts/dr/dr-status.sh --source-alias dc1 --source localhost:19092 --target localhost:29092
+#   ./scripts/dr/failover.sh --source-alias dc1 --source localhost:19092 \
+#                            --target-alias dc2 --target localhost:29092 --drill
+# =============================================================================
+
+x-kafka-common: &kafka-common
+  image: apache/kafka:4.1.2
+  restart: unless-stopped
+  healthcheck:
+    test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 >/dev/null 2>&1"]
+    interval: 10s
+    timeout: 10s
+    retries: 12
+    start_period: 30s
+
+services:
+  # ---- 主叢集 dc1 ----
+  dc1-kafka:
+    <<: *kafka-common
+    container_name: dc1-kafka
+    hostname: dc1-kafka
+    ports: ["19092:19092"]
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@dc1-kafka:9093
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_LISTENERS: INTERNAL://:9092,CONTROLLER://:9093,EXTERNAL://:19092
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://dc1-kafka:9092,EXTERNAL://localhost:19092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_SHARE_COORDINATOR_STATE_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_SHARE_COORDINATOR_STATE_TOPIC_MIN_ISR: 1
+      KAFKA_HEAP_OPTS: -Xmx512M -Xms512M
+      CLUSTER_ID: dr-demo-dc1-cluster
+    volumes: ["dc1-data:/var/lib/kafka/data"]
+    networks: [dr-net]
+
+  # ---- 備援叢集 dc2 ----
+  dc2-kafka:
+    <<: *kafka-common
+    container_name: dc2-kafka
+    hostname: dc2-kafka
+    ports: ["29092:29092"]
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@dc2-kafka:9093
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_LISTENERS: INTERNAL://:9092,CONTROLLER://:9093,EXTERNAL://:29092
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://dc2-kafka:9092,EXTERNAL://localhost:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_SHARE_COORDINATOR_STATE_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_SHARE_COORDINATOR_STATE_TOPIC_MIN_ISR: 1
+      KAFKA_HEAP_OPTS: -Xmx512M -Xms512M
+      CLUSTER_ID: dr-demo-dc2-cluster
+    volumes: ["dc2-data:/var/lib/kafka/data"]
+    networks: [dr-net]
+
+volumes:
+  dc1-data:
+  dc2-data:
+
+networks:
+  dr-net:
+    driver: bridge

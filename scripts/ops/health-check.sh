@@ -94,7 +94,7 @@ fi
 BROKERS="$("$(kafka_bin kafka-broker-api-versions.sh)" \
     --bootstrap-server "${BOOTSTRAP_SERVERS}" \
     ${KAFKA_CLIENT_CONFIG:+--command-config "${KAFKA_CLIENT_CONFIG}"} 2>/dev/null \
-    | grep -cE '^\S+:[0-9]+ \(id:' || echo 0)"
+    | grep -cE '^\S+:[0-9]+ \(id:' || true)"
 if (( EXPECTED_BROKERS > 0 )) && (( BROKERS < EXPECTED_BROKERS )); then
   record "broker_count" CRIT "存活 ${BROKERS} 個，預期 ${EXPECTED_BROKERS} 個"
 else

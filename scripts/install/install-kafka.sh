@@ -290,13 +290,67 @@ export LOG_DIR="${KAFKA_LOG_DIR}"
 export JMX_PORT="\${JMX_PORT:-${JMX_PORT}}"
 exec "${KAFKA_HOME}/bin/kafka-server-start.sh" "\$@" "${SERVER_PROPS}"
 EOF
-  cat > "${KAFKA_BASE_DIR}/stop.sh" <<EOF
+  # 用 quoted heredoc 寫出樣板（內容完全不做展開），再把三個路徑替換進去。
+  # 這樣可以避免多層跳脫符號寫錯。
+  cat > "${KAFKA_BASE_DIR}/stop.sh" <<'STOP_TMPL'
 #!/usr/bin/env bash
 # 由 install-kafka.sh 產生。務必用 graceful shutdown，
 # 讓 broker 把 leader 交接出去並把 log 索引寫完整。
+#
+# 注意：Kafka 內建的 kafka-server-stop.sh 是用 pattern 比對殺掉「這台機器上所有」
+# 的 kafka.Kafka 行程。同一台跑多個 broker（例如本機練習叢集）時會誤殺，
+# 所以這裡以安裝時記錄的 pid 為主，必要時再用設定檔路徑精準反查。
 set -Eeuo pipefail
-exec "${KAFKA_HOME}/bin/kafka-server-stop.sh" "\$@"
-EOF
+PID_FILE="__PID_FILE__"
+SERVER_PROPS="__SERVER_PROPS__"
+KAFKA_HOME="__KAFKA_HOME__"
+SIGNAL="${SIGNAL:-TERM}"
+
+resolve_pid() {
+  # 1) pid 檔：必須存在、非空，而且行程還活著
+  if [[ -s "${PID_FILE}" ]]; then
+    local p
+    p="$(tr -d '[:space:]' < "${PID_FILE}")"
+    if [[ -n "${p}" ]] && kill -0 "${p}" 2>/dev/null; then
+      printf '%s' "${p}"; return 0
+    fi
+  fi
+  # 2) 用「這個 broker 的設定檔路徑」反查，不會誤中同機其他 broker。
+  #    樣式開頭綁定 java 執行檔，避免比對到「命令列剛好含有這串字」的 shell。
+  local found
+  found="$(pgrep -f "^[^ ]*java .*kafka[.]Kafka .*${SERVER_PROPS}( |$)" 2>/dev/null | head -1 || true)"
+  if [[ -n "${found}" ]]; then printf '%s' "${found}"; return 0; fi
+  return 1
+}
+
+if PID="$(resolve_pid)"; then
+  echo "送出 SIG${SIGNAL} 給 pid ${PID}"
+  kill "-${SIGNAL}" "${PID}"
+  for _ in $(seq 1 120); do
+    if ! kill -0 "${PID}" 2>/dev/null; then
+      rm -f "${PID_FILE}"; echo "已停止"; exit 0
+    fi
+    sleep 1
+  done
+  echo "120 秒後仍未結束，請人工檢查 pid ${PID}" >&2
+  exit 1
+fi
+
+rm -f "${PID_FILE}"
+echo "找不到這個 broker 的行程（設定檔：${SERVER_PROPS}），可能已經停止。" >&2
+if [[ "${ALLOW_PATTERN_KILL:-false}" == "true" ]]; then
+  echo "ALLOW_PATTERN_KILL=true：改用 kafka-server-stop.sh（會殺掉本機所有 broker）" >&2
+  exec "${KAFKA_HOME}/bin/kafka-server-stop.sh" "$@"
+fi
+exit 0
+STOP_TMPL
+
+  sed -i \
+    -e "s|__PID_FILE__|${KAFKA_BASE_DIR}/kafka.pid|" \
+    -e "s|__SERVER_PROPS__|${SERVER_PROPS}|" \
+    -e "s|__KAFKA_HOME__|${KAFKA_HOME}|" \
+    "${KAFKA_BASE_DIR}/stop.sh"
+
   chmod +x "${KAFKA_BASE_DIR}/start.sh" "${KAFKA_BASE_DIR}/stop.sh"
   log_ok "${KAFKA_BASE_DIR}/start.sh 、 stop.sh"
 fi

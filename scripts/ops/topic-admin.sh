@@ -40,7 +40,7 @@ case "${SUBCMD}" in
     kafka_topics --describe 2>/dev/null \
       | awk '/^Topic: /{printf "  %-40s partitions=%-4s RF=%-3s\n", $2, $6, $8}' \
       | sort
-    printf '\n  共 %s 個 topic\n' "$(kafka_topics --list 2>/dev/null | grep -c . || echo 0)"
+    printf '\n  共 %s 個 topic\n' "$(kafka_topics --list 2>/dev/null | grep -c . || true)"
     ;;
 
   describe)
@@ -68,7 +68,8 @@ case "${SUBCMD}" in
     # 安全檢查：RF 不可超過 broker 數
     BROKERS="$("$(kafka_bin kafka-broker-api-versions.sh)" \
         --bootstrap-server "${BOOTSTRAP_SERVERS}" 2>/dev/null \
-        | grep -cE '^\S+:[0-9]+ \(id:' || echo 1)"
+        | grep -cE '^\S+:[0-9]+ \(id:' || true)"
+    (( BROKERS < 1 )) && BROKERS=1
     if (( RF > BROKERS )); then
       die "replication-factor=${RF} 大於 broker 數 ${BROKERS}，建立會失敗"
     fi

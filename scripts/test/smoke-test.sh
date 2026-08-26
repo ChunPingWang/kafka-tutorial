@@ -53,7 +53,7 @@ detect_replication_factor() {
   brokers="$("$(kafka_bin kafka-broker-api-versions.sh)" \
       --bootstrap-server "${BOOTSTRAP_SERVERS}" \
       ${KAFKA_CLIENT_CONFIG:+--command-config "${KAFKA_CLIENT_CONFIG}"} 2>/dev/null \
-      | grep -cE '^\S+:[0-9]+ \(id:' || echo 0)"
+      | grep -cE '^\S+:[0-9]+ \(id:' || true)"
   (( brokers < 1 )) && brokers=1
   (( brokers > 3 )) && brokers=3
   printf '%s' "${brokers}"

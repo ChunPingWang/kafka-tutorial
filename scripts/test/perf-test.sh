@@ -59,7 +59,8 @@ trap cleanup EXIT
 cluster_ready || die "叢集無法連線：${BOOTSTRAP_SERVERS}"
 
 RF="$("$(kafka_bin kafka-broker-api-versions.sh)" --bootstrap-server "${BOOTSTRAP_SERVERS}" 2>/dev/null \
-      | grep -cE '^\S+:[0-9]+ \(id:' || echo 1)"
+      | grep -cE '^\S+:[0-9]+ \(id:' || true)"
+RF="${RF:-1}"
 (( RF > 3 )) && RF=3
 (( RF < 1 )) && RF=1
 

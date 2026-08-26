@@ -1,0 +1,38 @@
+# =============================================================================
+# 用戶端安全性設定範例（SASL/SCRAM over TLS）
+#
+# 使用方式：
+#   cp conf/security/client.properties.example conf/security/client.properties
+#   chmod 600 conf/security/client.properties     # 裡面有密碼！
+#   在 conf/kafka-env.sh 設定：
+#     export KAFKA_CLIENT_CONFIG="${PWD}/conf/security/client.properties"
+#
+# 之後 scripts/ 底下所有腳本都會自動帶上這個設定。
+# =============================================================================
+
+# ---- 傳輸層 ----
+# SASL_SSL   = 加密 + 帳密驗證（正式環境建議）
+# SASL_PLAINTEXT = 只驗證不加密（僅限完全信任的內網）
+# SSL        = 只加密 + 憑證驗證
+security.protocol=SASL_SSL
+
+# ---- 驗證機制 ----
+# SCRAM-SHA-512：帳密存在 Kafka 內部，不需外部系統，適合大多數情況
+# PLAIN：帳密寫在 broker 設定檔，變更要重啟，不建議
+# GSSAPI：Kerberos，適合已有 AD/Kerberos 的企業環境
+# OAUTHBEARER：走 OIDC/OAuth2
+sasl.mechanism=SCRAM-SHA-512
+sasl.jaas.config=org.apache.kafka.common.security.scram.ScramLoginModule required \
+  username="app-user" \
+  password="CHANGE_ME";
+
+# ---- TLS ----
+ssl.truststore.location=/opt/kafka/conf/security/kafka.truststore.jks
+ssl.truststore.password=CHANGE_ME
+# 主機名稱驗證：務必保持啟用（設成空字串等於關閉，會讓中間人攻擊變得可行）
+ssl.endpoint.identification.algorithm=https
+
+# ---- 雙向 TLS（mTLS）時才需要 ----
+#ssl.keystore.location=/opt/kafka/conf/security/kafka.keystore.jks
+#ssl.keystore.password=CHANGE_ME
+#ssl.key.password=CHANGE_ME

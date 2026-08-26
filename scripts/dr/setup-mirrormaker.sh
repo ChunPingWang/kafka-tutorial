@@ -80,7 +80,7 @@ check_cluster() {
   if BOOTSTRAP_SERVERS="${bs}" cluster_ready; then
     local n
     n="$("${KAFKA_HOME}/bin/kafka-broker-api-versions.sh" --bootstrap-server "${bs}" 2>/dev/null \
-        | grep -cE '^\S+:[0-9]+ \(id:' || echo 0)"
+        | grep -cE '^\S+:[0-9]+ \(id:' || true)"
     log_ok "${name}（${bs}）可連線，${n} 個 broker"
     if (( MM2_RF > n )); then
       log_warn "${name} 只有 ${n} 個 broker，但 --rf=${MM2_RF}；MM2 內部 topic 會建立失敗"

@@ -227,7 +227,7 @@ created_by=$(id -un)@$(hostname -f 2>/dev/null || hostname)
 bootstrap_servers=${BOOTSTRAP_SERVERS}
 kafka_version=${KAFKA_VERSION}
 cluster_id=${CLUSTER_ID_VAL:-unknown}
-broker_count=$(grep -c 'id:' "${BACKUP_DIR}/cluster/brokers.txt" 2>/dev/null || echo 0)
+broker_count=$(grep -c 'id:' "${BACKUP_DIR}/cluster/brokers.txt" 2>/dev/null || true)
 topic_count=${TOPIC_COUNT}
 group_count=${GROUP_TOTAL}
 EOF
