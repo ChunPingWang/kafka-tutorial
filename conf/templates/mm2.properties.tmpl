@@ -1,0 +1,97 @@
+# =============================================================================
+# MirrorMaker 2 設定範本（跨叢集複寫 = 災難備援的資料層）
+# 由 scripts/dr/setup-mirrormaker.sh 替換 @@...@@ 後產生。
+#
+# MM2 會在目標叢集建立這些 topic：
+#   <source>.<topic>              複寫過來的資料（預設加上來源前綴）
+#   <source>.checkpoints.internal consumer offset 對照表
+#   heartbeats                    心跳，用來量測複寫延遲
+#   mm2-offsets/configs/status.<target>.internal   Connect 框架自身狀態
+# =============================================================================
+
+# 叢集別名（會成為 topic 前綴，請用簡短好認的名字，例如 dc1 / dc2）
+clusters = @@SOURCE_ALIAS@@, @@TARGET_ALIAS@@
+
+@@SOURCE_ALIAS@@.bootstrap.servers = @@SOURCE_BOOTSTRAP@@
+@@TARGET_ALIAS@@.bootstrap.servers = @@TARGET_BOOTSTRAP@@
+
+# ---- 複寫方向 ---------------------------------------------------------------
+# A->B 啟用；B->A 關閉 = 單向複寫（主備架構）
+# 兩邊都開 = 雙向複寫（雙活架構，注意 MM2 靠 topic 前綴避免無窮迴圈）
+@@SOURCE_ALIAS@@->@@TARGET_ALIAS@@.enabled = true
+@@TARGET_ALIAS@@->@@SOURCE_ALIAS@@.enabled = @@REVERSE_ENABLED@@
+
+# ---- 要複寫哪些 topic --------------------------------------------------------
+# 支援 Java regex。預設排除內部 topic 與 MM2 自己的 topic。
+@@SOURCE_ALIAS@@->@@TARGET_ALIAS@@.topics = @@TOPICS_PATTERN@@
+@@SOURCE_ALIAS@@->@@TARGET_ALIAS@@.topics.exclude = .*[\-\.]internal, .*\.replica, __.*, .*-config, mm2-.*
+
+# 要複寫哪些 consumer group 的 offset
+@@SOURCE_ALIAS@@->@@TARGET_ALIAS@@.groups = @@GROUPS_PATTERN@@
+@@SOURCE_ALIAS@@->@@TARGET_ALIAS@@.groups.exclude = console-consumer-.*, connect-.*, __.*
+
+# ---- topic 命名策略 ----------------------------------------------------------
+# 預設 DefaultReplicationPolicy：目標端 topic 名稱 = <來源別名>.<原名>
+#   好處：一眼看出資料來源、雙向複寫不會迴圈
+#   壞處：切換時 consumer 要改讀 <來源別名>.<原名>
+#
+# IdentityReplicationPolicy：目標端保持原名，切換時 client 不用改 topic 名
+#   代價：不能做雙向複寫（會無窮迴圈）
+@@REPLICATION_POLICY_LINE@@
+
+# ---- 複寫行為 ----------------------------------------------------------------
+# 同步 topic 的設定（partition 數、retention 等）
+sync.topic.configs.enabled = true
+sync.topic.configs.interval.seconds = 60
+# 同步 ACL
+sync.topic.acls.enabled = @@SYNC_ACLS@@
+# 偵測來源端新 topic 的間隔
+refresh.topics.enabled = true
+refresh.topics.interval.seconds = 30
+refresh.groups.enabled = true
+refresh.groups.interval.seconds = 60
+# 產生 checkpoint（consumer offset 對照）的間隔——切換時的 RPO 與這個值直接相關
+emit.checkpoints.enabled = true
+emit.checkpoints.interval.seconds = @@CHECKPOINT_INTERVAL@@
+# 把換算後的 consumer offset 直接寫進目標叢集的 __consumer_offsets。
+# 開啟後，災難切換時 consumer 換個 bootstrap 就能接著跑，不必手動搬 offset。
+# 注意：只有在目標端「該 group 沒有 active consumer」時才會寫入，
+#       所以雙活架構下同名 group 兩邊同時在跑會同步不到。
+@@SOURCE_ALIAS@@->@@TARGET_ALIAS@@.sync.group.offsets.enabled = true
+@@SOURCE_ALIAS@@->@@TARGET_ALIAS@@.sync.group.offsets.interval.seconds = @@CHECKPOINT_INTERVAL@@
+# 心跳：用來量測端到端複寫延遲
+emit.heartbeats.enabled = true
+emit.heartbeats.interval.seconds = 5
+
+# ---- 目標端 topic 的副本設定 -------------------------------------------------
+# 這幾個是 MM2 內部 topic 的 RF，正式環境務必 >= 3
+replication.factor = @@REPLICATION_FACTOR@@
+checkpoints.topic.replication.factor = @@REPLICATION_FACTOR@@
+heartbeats.topic.replication.factor = @@REPLICATION_FACTOR@@
+offset-syncs.topic.replication.factor = @@REPLICATION_FACTOR@@
+offset.storage.replication.factor = @@REPLICATION_FACTOR@@
+status.storage.replication.factor = @@REPLICATION_FACTOR@@
+config.storage.replication.factor = @@REPLICATION_FACTOR@@
+
+# ---- 平行度與效能 ------------------------------------------------------------
+# tasks.max 建議設為「要複寫的 partition 總數 / 每個 task 想負責的 partition 數」，
+# 上限受 Connect worker 數限制。太小會成為複寫瓶頸。
+tasks.max = @@TASKS_MAX@@
+
+# producer 端調校：複寫是批次搬運，可以放大批次換吞吐
+@@SOURCE_ALIAS@@->@@TARGET_ALIAS@@.producer.override.batch.size = 262144
+@@SOURCE_ALIAS@@->@@TARGET_ALIAS@@.producer.override.linger.ms = 50
+@@SOURCE_ALIAS@@->@@TARGET_ALIAS@@.producer.override.compression.type = lz4
+@@SOURCE_ALIAS@@->@@TARGET_ALIAS@@.producer.override.acks = all
+@@SOURCE_ALIAS@@->@@TARGET_ALIAS@@.producer.override.max.in.flight.requests.per.connection = 1
+
+# consumer 端：一次抓多一點，減少 round trip
+@@SOURCE_ALIAS@@->@@TARGET_ALIAS@@.consumer.override.max.poll.records = 2000
+@@SOURCE_ALIAS@@->@@TARGET_ALIAS@@.consumer.override.receive.buffer.bytes = 1048576
+
+# ---- 安全性（需要時取消註解並填入）------------------------------------------
+#@@SOURCE_ALIAS@@.security.protocol = SASL_SSL
+#@@SOURCE_ALIAS@@.sasl.mechanism = SCRAM-SHA-512
+#@@SOURCE_ALIAS@@.sasl.jaas.config = org.apache.kafka.common.security.scram.ScramLoginModule required username="mm2" password="CHANGEME";
+#@@SOURCE_ALIAS@@.ssl.truststore.location = /path/to/truststore.jks
+#@@SOURCE_ALIAS@@.ssl.truststore.password = CHANGEME
