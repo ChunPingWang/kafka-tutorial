@@ -20,3 +20,6 @@ downloads/
 *.tgz
 *.tar.gz
 .tmp/
+
+# 執行期產生的 pid 檔
+*.pid
