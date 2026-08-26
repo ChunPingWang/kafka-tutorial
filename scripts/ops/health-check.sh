@@ -2,15 +2,17 @@
 # =============================================================================
 # health-check.sh - 叢集健康檢查（適合放進 cron / 監控系統）
 #
-# 檢查項目：
+# 檢查項目（共 10 項）：
 #   1. Broker 存活數
-#   2. KRaft controller quorum
-#   3. Under-replicated / offline partition
-#   4. 沒有 leader 的 partition
-#   5. Preferred leader 失衡
-#   6. Consumer group lag 超標
-#   7. 磁碟使用率
-#   8. Log 目錄大小分布
+#   2. KRaft controller quorum（leader 是否存在、follower 落後量）
+#   3. Under-replicated partition
+#   4. Under-min-ISR partition（acks=all 的寫入是否正被拒絕）
+#   5. Unavailable partition（沒有 leader）
+#   6. At-min-ISR partition（再掉一個副本就會停寫）
+#   7. Topic 數量
+#   8. Consumer group lag 超標
+#   9. 本機磁碟使用率
+#  10. Broker 之間的資料量分布
 #
 # 用法：
 #   ./scripts/ops/health-check.sh                 # 人類可讀

@@ -23,6 +23,12 @@
 set -Eeuo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/../lib/common.sh"
 
+if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+  sed -n '2,21p' "$0" | sed 's/^# \{0,1\}//'
+  exit 0
+fi
+[[ $# -gt 0 ]] && die "smoke-test.sh 不接受位置參數（用環境變數設定，見 --help）：$*"
+
 TOPIC="${TEST_TOPIC:-smoke-test-$(date +%s)}"
 GROUP="${TEST_GROUP:-smoke-group-$(date +%s)}"
 MSG_COUNT="${MSG_COUNT:-100}"

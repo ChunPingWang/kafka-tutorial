@@ -12,6 +12,12 @@
 set -Eeuo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/../lib/common.sh"
 
+if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+  sed -n '2,11p' "$0" | sed 's/^# \{0,1\}//'
+  exit 0
+fi
+[[ $# -gt 0 ]] && die "preflight.sh 不接受位置參數（用環境變數設定，見 --help）：$*"
+
 STRICT="${STRICT:-false}"
 FAIL=0
 WARN=0
