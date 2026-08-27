@@ -6,7 +6,7 @@
 #   <source>.<topic>              複寫過來的資料（預設加上來源前綴）
 #   <source>.checkpoints.internal consumer offset 對照表
 #   heartbeats                    心跳，用來量測複寫延遲
-#   mm2-offsets/configs/status.<target>.internal   Connect 框架自身狀態
+#   mm2-offsets/configs/status.<source>.internal   Connect 框架自身狀態（以「來源」別名命名）
 # =============================================================================
 
 # 叢集別名（會成為 topic 前綴，請用簡短好認的名字，例如 dc1 / dc2）

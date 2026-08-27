@@ -110,20 +110,24 @@ fi
 TMPL="${REPO_ROOT}/conf/templates/mm2.properties.tmpl"
 [[ -f "${TMPL}" ]] || die "找不到範本 ${TMPL}"
 
-sed \
-  -e "s|@@SOURCE_ALIAS@@|${SOURCE_ALIAS}|g" \
-  -e "s|@@TARGET_ALIAS@@|${TARGET_ALIAS}|g" \
-  -e "s|@@SOURCE_BOOTSTRAP@@|${SOURCE_BOOTSTRAP}|g" \
-  -e "s|@@TARGET_BOOTSTRAP@@|${TARGET_BOOTSTRAP}|g" \
-  -e "s|@@TOPICS_PATTERN@@|${TOPICS_PATTERN}|g" \
-  -e "s|@@GROUPS_PATTERN@@|${GROUPS_PATTERN}|g" \
-  -e "s|@@REVERSE_ENABLED@@|${BIDIRECTIONAL}|g" \
-  -e "s|@@REPLICATION_POLICY_LINE@@|${POLICY_LINE}|g" \
-  -e "s|@@REPLICATION_FACTOR@@|${MM2_RF}|g" \
-  -e "s|@@TASKS_MAX@@|${TASKS_MAX}|g" \
-  -e "s|@@CHECKPOINT_INTERVAL@@|${CHECKPOINT_INTERVAL}|g" \
-  -e "s|@@SYNC_ACLS@@|${SYNC_ACLS}|g" \
-  "${TMPL}" > "${MM2_CONF}"
+# 用 bash 字面替換渲染，不用 sed：
+# --topics/--groups 是 Java regex，「orders|payments」這種交替寫法
+# 會撞上 sed 的分隔符（|），而值裡的 & 也會被 sed 展開成比對結果。
+# bash 的 ${var//pattern/replacement} 對替換內容是完全字面的，沒有這些地雷。
+RENDERED="$(<"${TMPL}")"
+RENDERED="${RENDERED//@@SOURCE_ALIAS@@/${SOURCE_ALIAS}}"
+RENDERED="${RENDERED//@@TARGET_ALIAS@@/${TARGET_ALIAS}}"
+RENDERED="${RENDERED//@@SOURCE_BOOTSTRAP@@/${SOURCE_BOOTSTRAP}}"
+RENDERED="${RENDERED//@@TARGET_BOOTSTRAP@@/${TARGET_BOOTSTRAP}}"
+RENDERED="${RENDERED//@@TOPICS_PATTERN@@/${TOPICS_PATTERN}}"
+RENDERED="${RENDERED//@@GROUPS_PATTERN@@/${GROUPS_PATTERN}}"
+RENDERED="${RENDERED//@@REVERSE_ENABLED@@/${BIDIRECTIONAL}}"
+RENDERED="${RENDERED//@@REPLICATION_POLICY_LINE@@/${POLICY_LINE}}"
+RENDERED="${RENDERED//@@REPLICATION_FACTOR@@/${MM2_RF}}"
+RENDERED="${RENDERED//@@TASKS_MAX@@/${TASKS_MAX}}"
+RENDERED="${RENDERED//@@CHECKPOINT_INTERVAL@@/${CHECKPOINT_INTERVAL}}"
+RENDERED="${RENDERED//@@SYNC_ACLS@@/${SYNC_ACLS}}"
+printf '%s\n' "${RENDERED}" > "${MM2_CONF}"
 
 log_ok "已產生 ${MM2_CONF}"
 

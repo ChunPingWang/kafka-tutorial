@@ -56,6 +56,10 @@ x-kafka-env: &kafka-env
   KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 3000
   KAFKA_LOG_RETENTION_HOURS: 24
   KAFKA_HEAP_OPTS: -Xmx512M -Xms512M
+  # 一定要明確指向 volume 掛載點：apache/kafka 映像檔的預設 log.dirs 在
+  # /tmp/kafka-logs（container 可寫層），不設這個的話 volume 形同虛設，
+  # docker compose down 資料就沒了
+  KAFKA_LOG_DIRS: /var/lib/kafka/data
 
 services:
   kafka-1:

@@ -68,17 +68,31 @@ ng() { FAIL=$(( FAIL + 1 )); printf '  %s✘%s %s\n' "${C_RED}" "${C_RESET}" "$*
 # -----------------------------------------------------------------------------
 section "L1 結構檢查：${TARGET_PATH}"
 for f in manifest.txt topics/topic-list.txt topics/recreate-topics.sh \
-         groups/group-list.txt config/server.properties cluster/cluster-id.txt; do
+         groups/group-list.txt cluster/cluster-id.txt; do
   if [[ -f "${TARGET_PATH}/${f}" ]]; then
     ok "${f}"
   else
     ng "缺少 ${f}"
   fi
 done
+# server.properties 是「有才備份」的（備份主機的 broker 設定可能放在別處），
+# 缺少它的備份仍完全可還原——列為提醒而非失敗，否則會把好備份判死、
+# 連帶讓 restore-cluster.sh 的前置驗證擋住整個還原
+if [[ -f "${TARGET_PATH}/config/server.properties" ]]; then
+  ok "config/server.properties"
+else
+  log_warn "  備份中沒有 config/server.properties（備份時該檔不在預期路徑；不影響還原）"
+fi
 
 if [[ -f "${TARGET_PATH}/manifest.txt" ]]; then
-  # shellcheck disable=SC2046
-  eval $(grep -E '^(backup_id|cluster_id|topic_count|group_count|broker_count|kafka_version)=' "${TARGET_PATH}/manifest.txt" | sed 's/^/M_/')
+  # 逐行安全解析——不能用 eval：manifest 是「正在被驗證」的檔案，
+  # 內容不可信，eval 等於在驗證階段執行任意程式碼
+  while IFS='=' read -r mk mv; do
+    case "${mk}" in
+      backup_id|cluster_id|topic_count|group_count|broker_count|kafka_version)
+        printf -v "M_${mk}" '%s' "${mv}" ;;
+    esac
+  done < "${TARGET_PATH}/manifest.txt"
   printf '\n'
   printf '  backup_id     : %s\n' "${M_backup_id:-?}"
   printf '  cluster_id    : %s\n' "${M_cluster_id:-?}"

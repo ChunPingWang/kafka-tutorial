@@ -57,8 +57,13 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# 故障注入是「真的」停掉 broker，DRY_RUN 語意在這裡無法成立
+# （kafka_* 包裝會被跳過、docker stop 卻照跑，狀態會亂掉）——直接拒絕。
+[[ "${DRY_RUN}" == "true" ]] && die "resilience-test 不支援 DRY_RUN=true：故障注入無法「預演」，請直接執行或先讀 --help"
+
 cluster_ready || die "叢集無法連線"
-BROKERS="$("$(kafka_bin kafka-broker-api-versions.sh)" --bootstrap-server "${BOOTSTRAP_SERVERS}" 2>/dev/null \
+BROKERS="$("$(kafka_bin kafka-broker-api-versions.sh)" --bootstrap-server "${BOOTSTRAP_SERVERS}" \
+    ${KAFKA_CLIENT_CONFIG:+--command-config "${KAFKA_CLIENT_CONFIG}"} 2>/dev/null \
     | grep -cE '^\S+:[0-9]+ \(id:' || true)"
 (( BROKERS < 1 )) && BROKERS=1
 
@@ -67,9 +72,16 @@ printf '  叢集 broker 數 : %s\n' "${BROKERS}" >&2
 printf '  測試 topic     : %s\n' "${TOPIC}" >&2
 
 RF=3; MIN_ISR=2
+STRICT_MINISR=true
 if (( BROKERS < 3 )); then
   log_warn "叢集只有 ${BROKERS} 個 broker。故障注入測試需要 3 個以上才有意義。"
   RF="${BROKERS}"; MIN_ISR=1
+elif (( BROKERS > 3 )); then
+  # RF=3 但 broker 更多時，六個 partition 的副本「不一定」都落在被停掉的那台上，
+  # 測試 3 的「全部寫不進去」預期不成立（沒涵蓋該台的 partition 照常收）——
+  # 那不是叢集的錯，是拓撲使然，改以資訊性方式回報而非判 FAIL。
+  log_warn "叢集有 ${BROKERS}（>3）個 broker：測試 3 的嚴格斷言改為資訊性檢查"
+  STRICT_MINISR=false
 fi
 
 kafka_topics --create --topic "${TOPIC}" --partitions 6 --replication-factor "${RF}" \
@@ -84,6 +96,7 @@ produce_n() {   # produce_n <筆數> <acks> ；回傳實際成功筆數
   seq 1 "${n}" | sed 's/^/msg-/' \
     | "$(kafka_bin kafka-console-producer.sh)" \
         --bootstrap-server "${BOOTSTRAP_SERVERS}" --topic "${TOPIC}" \
+        ${KAFKA_CLIENT_CONFIG:+--producer.config "${KAFKA_CLIENT_CONFIG}"} \
         --request-required-acks "${acks}" >/dev/null 2>&1 || true
   after="$("$(kafka_bin kafka-get-offsets.sh)" --bootstrap-server "${BOOTSTRAP_SERVERS}" \
              --topic "${TOPIC}" 2>/dev/null | awk -F: '{s+=$3} END{print s+0}')"
@@ -153,20 +166,25 @@ else
   if (( GOT == 0 )); then
     ok "min.insync.replicas=${RF} 但只有 $(( RF - 1 )) 個副本時，acks=all 的資料讀不到"
     printf '      producer 收到 NOT_ENOUGH_REPLICAS，這正是「寧可停寫也不遺失資料」的設計。\n' >&2
+  elif [[ "${STRICT_MINISR}" != "true" ]]; then
+    skip "有 ${GOT} 筆寫入成功——broker 數 > 3，這些 partition 的副本不含被停掉的那台，屬預期行為"
   else
     ng "預期讀不到，實際多了 ${GOT} 筆可見訊息"
   fi
 
-  # acks=1：Kafka 4.x 在 ISR 不足時，訊息可能已經寫進 leader 的 log，
-  # 但 high watermark 不會前進，所以 consumer 讀不到。
-  # produce_n 是用 end offset（= high watermark）量測，因此這裡也應該是 0。
+  # acks=1：在啟用 ELR（KIP-966，新建 4.x 叢集的預設）的叢集上，
+  # ISR < min.insync.replicas 時 high watermark 不前進，所以這裡量到 0。
+  # 從 4.0 之前升上來、metadata 尚未啟用 ELR 的叢集沒有這個保證：
+  # acks=1 的訊息會立即可見——那是「舊語意」，不是故障，不能判 FAIL。
   ACK1_GOT="$(produce_n 100 1)"
   if (( ACK1_GOT == 0 )); then
-    ok "acks=1 在 ISR 不足時，訊息同樣無法被消費（high watermark 不前進）"
+    ok "acks=1 在 ISR 不足時，訊息同樣無法被消費（high watermark 不前進，ELR 語意）"
     printf '      注意：這些訊息可能已經寫進 leader 的 log，只是還不可見；\n' >&2
     printf '      等副本追上、ISR 恢復之後才會一次浮現。\n' >&2
+  elif [[ "${STRICT_MINISR}" != "true" ]]; then
+    skip "acks=1 有 ${ACK1_GOT} 筆可見（部分 partition 未受影響，屬預期）"
   else
-    ng "acks=1 竟然有 ${ACK1_GOT} 筆立即可見，與預期不符"
+    skip "acks=1 有 ${ACK1_GOT} 筆立即可見——此叢集未啟用 ELR（KIP-966）語意（多見於從 ≤4.0 升級的 metadata），acks=1 本就沒有 min.isr 保護；請理解這正是不要用 acks=1 的理由"
   fi
 
   # acks=0 是真正的「射後不理」：broker 拒收也不會有人知道，資料就這樣消失。

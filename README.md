@@ -961,6 +961,11 @@ unclean.leader.election.enable = false
 **常見錯誤：RF=3 但 min.isr=3。** 這樣掉任何一台就完全停寫，
 可用性反而比 RF=2 還差。**`min.insync.replicas` 一定要小於 `replication.factor`。**
 
+> 完整、逐行註解的 client 設定範例在 `examples/producer-config.properties`
+> 與 `examples/consumer-config.properties`——可直接接在 `kafka-console-producer.sh
+> --producer.config` / `kafka-console-consumer.sh --consumer.config` 使用，
+> 也是應用程式設定的起點。
+
 ### 8.3 `unclean.leader.election.enable` 一定要是 false
 
 ```properties
@@ -2553,14 +2558,19 @@ MirrorMaker 2 建立在 Kafka Connect 之上，會複寫：
   --start
 ```
 
-單機測試環境（RF 只能 1）：
+單機練習最快的方式是用現成的雙叢集 Docker 環境
+（`docker/docker-compose.dr.yml`，port 與三節點練習環境刻意錯開，可同時存在）：
 
 ```bash
+docker compose -f docker/docker-compose.dr.yml up -d      # dc1=18092, dc2=28092
+
 ./scripts/dr/setup-mirrormaker.sh \
-  --source-alias dc1 --source localhost:9092 \
-  --target-alias dc2 --target localhost:19092 \
+  --source-alias dc1 --source localhost:18092 \
+  --target-alias dc2 --target localhost:28092 \
   --rf 1 --tasks 2 --start
 ```
+
+之後 22.5 的 `dr-status.sh` 與 23 章的 `failover.sh --drill` 都可以直接對這兩座叢集演練。
 
 ### 22.3 兩種命名策略，選錯會很痛
 

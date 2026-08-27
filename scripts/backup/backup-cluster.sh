@@ -120,12 +120,13 @@ while IFS= read -r t; do
     printf '"${T}" --bootstrap-server "${BOOTSTRAP_SERVERS}" --create --if-not-exists \\\n'
     printf '  --topic %q --partitions %s --replication-factor %s' "${t}" "${PARTS}" "${RF}"
     if [[ -n "${CFG}" && "${CFG}" != "Configs:" ]]; then
-      # Configs 以逗號分隔，逐一轉成 --config
-      IFS=',' read -ra KV <<<"${CFG}"
-      for kv in "${KV[@]}"; do
-        [[ -z "${kv}" ]] && continue
+      # 逗號只在「後面接 key=」時才是設定之間的分隔符；
+      # 值內的逗號（如 follower.replication.throttled.replicas=1:0,2:0）必須保留，
+      # 不能無腦用 IFS=',' 切
+      while IFS= read -r kv; do
+        [[ -z "${kv}" || "${kv}" != *=* ]] && continue
         printf ' \\\n  --config %q' "${kv}"
-      done
+      done < <(sed -E 's/,([a-zA-Z0-9._-]+=)/\n\1/g' <<<"${CFG}")
     fi
     printf ' \\\n  || { echo "  ✘ 建立失敗：%q" >&2; FAILED=$((FAILED+1)); FAILED_TOPICS="${FAILED_TOPICS} %q"; }\n\n' "${t}" "${t}"
   } >> "${RECREATE}"

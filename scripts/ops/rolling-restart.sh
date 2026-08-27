@@ -48,22 +48,49 @@ done
 
 [[ "${LOCAL_MODE}" == "true" || -n "${HOSTS}" ]] || die "請指定 --local 或 --hosts"
 
+# broker port 從 BOOTSTRAP_SERVERS 推導（第一個位址的 port），不再寫死 9092
+BROKER_PORT="${BROKER_PORT:-$(sed -E 's/^[^,]*:([0-9]+).*/\1/' <<<"${BOOTSTRAP_SERVERS}")}"
+[[ "${BROKER_PORT}" =~ ^[0-9]+$ ]] || BROKER_PORT=9092
+
+# metadata quorum 允許的最大 follower 落差（offset 數）
+QUORUM_MAX_LAG="${QUORUM_MAX_LAG:-1000}"
+
 # -----------------------------------------------------------------------------
-# 等待叢集完全同步：沒有 under-replicated、沒有 offline partition
+# KRaft quorum 健康：有 leader、follower 落差在允許範圍內。
+# 資料面的 URP 檢查「看不到」__cluster_metadata 的複寫狀態——
+# combined mode 下若只看 URP，可能在 controller 尚未歸隊時就重啟下一台，
+# 讓 quorum 掉到多數以下（metadata 面停擺、無法選 leader）。
+# -----------------------------------------------------------------------------
+quorum_healthy() {
+  local out leader lag
+  out="$(kafka_metadata describe --status 2>/dev/null)" || return 1
+  leader="$(awk '/LeaderId:/{print $2; exit}' <<<"${out}")"
+  lag="$(awk '/MaxFollowerLag:/{print $2; exit}' <<<"${out}")"
+  [[ "${leader}" =~ ^[0-9]+$ ]] || return 1
+  [[ "${lag}" =~ ^[0-9]+$ ]] || return 1
+  (( lag <= QUORUM_MAX_LAG ))
+}
+
+# -----------------------------------------------------------------------------
+# 等待叢集完全同步：資料面（無 URP／offline）＋ metadata 面（quorum 健康）
 # -----------------------------------------------------------------------------
 wait_fully_replicated() {
   local waited=0
-  log_info "等待所有 partition 完全同步（逾時 ${MAX_WAIT}s）..."
+  log_info "等待所有 partition 完全同步且 quorum 健康（逾時 ${MAX_WAIT}s）..."
   while (( waited < MAX_WAIT )); do
     if cluster_ready; then
       local ur unav
       ur="$(kafka_topics --describe --under-replicated-partitions 2>/dev/null | grep -c 'Topic:' || true)"
       unav="$(kafka_topics --describe --unavailable-partitions 2>/dev/null | grep -c 'Topic:' || true)"
       if (( ur == 0 )) && (( unav == 0 )); then
-        log_ok "完全同步（under-replicated=0, unavailable=0）"
-        return 0
+        if quorum_healthy; then
+          log_ok "完全同步（under-replicated=0, unavailable=0, quorum 正常）"
+          return 0
+        fi
+        log_info "  資料面已同步，等待 metadata quorum 恢復（已等 ${waited}s）"
+      else
+        log_info "  under-replicated=${ur} unavailable=${unav}（已等 ${waited}s）"
       fi
-      log_info "  under-replicated=${ur} unavailable=${unav}（已等 ${waited}s）"
     else
       log_info "  叢集尚未可連線（已等 ${waited}s）"
     fi
@@ -123,9 +150,9 @@ restart_local() {
 
   # 等待 port 釋放，最多 120 秒
   local waited=0
-  while port_in_use 9092 && (( waited < 120 )); do sleep 2; waited=$(( waited + 2 )); done
-  if port_in_use 9092; then
-    log_error "9092 在 120 秒後仍被佔用，broker 沒有正常關閉"
+  while port_in_use "${BROKER_PORT}" && (( waited < 120 )); do sleep 2; waited=$(( waited + 2 )); done
+  if port_in_use "${BROKER_PORT}"; then
+    log_error "${BROKER_PORT} 在 120 秒後仍被佔用，broker 沒有正常關閉"
     log_error "請人工檢查後再繼續（切勿直接 kill -9，會導致 log 復原時間變長）"
     exit 1
   fi
@@ -161,9 +188,16 @@ if systemctl is-active --quiet kafka 2>/dev/null; then
 else
   ${KAFKA_BASE_DIR}/stop.sh || true
   for i in \$(seq 1 60); do
-    ss -ltn 2>/dev/null | grep -q ':9092' || break
+    ss -ltn 2>/dev/null | grep -q ':${BROKER_PORT}' || break
     sleep 2
   done
+  # 舊行程若在 120 秒後仍佔著 port，「絕不能」直接啟動新的：
+  # 新行程會綁 port 失敗立刻死掉，而舊的（未升級的）繼續服務，
+  # 上層的同步檢查會全數通過——這台就被「假裝重啟成功」地跳過了。
+  if ss -ltn 2>/dev/null | grep -q ':${BROKER_PORT}'; then
+    echo "broker 未在 120 秒內釋放 port ${BROKER_PORT}，中止本機重啟（請人工檢查）" >&2
+    exit 1
+  fi
   nohup ${KAFKA_BASE_DIR}/start.sh > ${KAFKA_LOG_DIR}/kafka-stdout.log 2>&1 &
 fi
 EOF

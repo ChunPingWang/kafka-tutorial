@@ -142,6 +142,10 @@ run mkdir -p "${DOWNLOAD_DIR}" "${KAFKA_BASE_DIR}" "${KAFKA_CONF_DIR}" "${KAFKA_
 TARBALL="${DOWNLOAD_DIR}/${KAFKA_DIST}.tgz"
 if [[ -s "${TARBALL}" ]]; then
   log_info "已存在 ${TARBALL}，略過下載"
+elif [[ "${DRY_RUN}" == "true" ]]; then
+  # DRY_RUN 必須貫穿整個流程：不下載、不校驗（否則「預演」會真的抓 120MB
+  # 再因為後續步驟被跳過而在 sha512sum 崩潰）
+  log_info "[DRY-RUN] 將下載 ${KAFKA_MIRROR}/${KAFKA_VERSION}/${KAFKA_DIST}.tgz 並做 SHA512 校驗"
 else
   URL="${KAFKA_MIRROR}/${KAFKA_VERSION}/${KAFKA_DIST}.tgz"
   ALT_URL="${KAFKA_ARCHIVE_MIRROR}/${KAFKA_VERSION}/${KAFKA_DIST}.tgz"
@@ -256,9 +260,14 @@ else
     run rm -rf "${KAFKA_DATA_DIR:?}/"*
   fi
   if [[ -z "${CLUSTER_ID}" ]]; then
-    CLUSTER_ID="$("${KAFKA_HOME}/bin/kafka-storage.sh" random-uuid)"
-    log_info "產生新的 cluster.id：${CLUSTER_ID}"
-    log_warn "叢集其他節點必須使用「同一個」cluster.id，請記下來"
+    if [[ "${DRY_RUN}" == "true" ]]; then
+      CLUSTER_ID="<dry-run：屆時由 kafka-storage.sh random-uuid 產生>"
+      log_info "[DRY-RUN] 將產生新的 cluster.id"
+    else
+      CLUSTER_ID="$("${KAFKA_HOME}/bin/kafka-storage.sh" random-uuid)"
+      log_info "產生新的 cluster.id：${CLUSTER_ID}"
+      log_warn "叢集其他節點必須使用「同一個」cluster.id，請記下來"
+    fi
   else
     log_info "使用指定的 cluster.id：${CLUSTER_ID}"
   fi
@@ -370,16 +379,20 @@ if [[ "${DO_START}" != "true" ]]; then
 elif [[ "${DRY_RUN}" == "true" ]]; then
   log_info "[DRY-RUN] 略過啟動"
 else
-  if cluster_ready; then
-    log_info "偵測到 ${BOOTSTRAP_SERVERS} 已有服務在跑，略過啟動"
+  # 就緒檢查一定要打「這次安裝的 port」，不能用 BOOTSTRAP_SERVERS 的預設值：
+  # 否則 --broker-port 非 9092 時會誤報啟動逾時；9092 被別的服務佔用時
+  # 更會誤判「已在跑」而根本不啟動這台 broker。
+  LOCAL_BOOTSTRAP="localhost:${BROKER_PORT}"
+  if BOOTSTRAP_SERVERS="${LOCAL_BOOTSTRAP}" cluster_ready; then
+    log_info "偵測到 ${LOCAL_BOOTSTRAP} 已有服務在跑，略過啟動"
   else
     mkdir -p "${KAFKA_LOG_DIR}"
     nohup "${KAFKA_BASE_DIR}/start.sh" > "${KAFKA_LOG_DIR}/kafka-stdout.log" 2>&1 &
     echo $! > "${KAFKA_BASE_DIR}/kafka.pid"
     log_info "已在背景啟動（pid $(cat "${KAFKA_BASE_DIR}/kafka.pid")），log：${KAFKA_LOG_DIR}/kafka-stdout.log"
     if [[ "${ROLES}" != "controller" ]]; then
-      if wait_for_cluster 90; then
-        "${KAFKA_HOME}/bin/kafka-broker-api-versions.sh" --bootstrap-server "${BOOTSTRAP_SERVERS}" 2>/dev/null \
+      if BOOTSTRAP_SERVERS="${LOCAL_BOOTSTRAP}" wait_for_cluster 90; then
+        "${KAFKA_HOME}/bin/kafka-broker-api-versions.sh" --bootstrap-server "${LOCAL_BOOTSTRAP}" 2>/dev/null \
           | head -1 | sed 's/^/  /' >&2 || true
       else
         log_error "啟動逾時，請檢查 ${KAFKA_LOG_DIR}/kafka-stdout.log 與 ${KAFKA_LOG_DIR}/server.log"

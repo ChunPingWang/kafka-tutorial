@@ -225,13 +225,28 @@ groups:
           summary: "{{ $labels.instance }} 的 ISR 頻繁收縮"
           description: "副本反覆進出 ISR，通常是網路不穩、GC 停頓過長，或 replica.lag.time.max.ms 設太小。"
 
+      # 磁碟寫滿監控需要「檔案系統容量」，這是 node_exporter 的職責，
+      # Kafka 的 JMX 只知道 log 大小、不知道磁碟多大。
+      # 前提：已部署 node_exporter（正式環境本來就該有）。
+      # ★ 把 mountpoint="/data" 換成你的 Kafka 資料碟掛載點。
       - alert: KafkaDiskFillingUp
-        expr: predict_linear(kafka_log_size_bytes[6h], 24*3600) > 0.9 * 1e12
+        expr: |
+          predict_linear(node_filesystem_avail_bytes{mountpoint="/data"}[6h], 24*3600) < 0
         for: 30m
         labels: {severity: warning}
         annotations:
-          summary: "依目前成長速度，24 小時內磁碟可能寫滿"
+          summary: "{{ $labels.instance }} 依目前寫入速度，24 小時內資料碟將寫滿"
           description: "調整 retention，或擴充磁碟。Kafka 磁碟寫滿會直接停止服務。"
+
+      # 沒有 node_exporter 時的退而求其次：整機 log 寫入速率異常
+      # （抓的是「不正常的成長」，不是磁碟容量——兩者都要有才完整）
+      - alert: KafkaLogWriteSurge
+        expr: sum by (instance) (rate(kafka_log_size_bytes[30m])) > 50 * 1024 * 1024
+        for: 30m
+        labels: {severity: info}
+        annotations:
+          summary: "{{ $labels.instance }} 的 log 寫入速率持續超過 50MB/s"
+          description: "確認是否為預期流量；持續高寫入請對照磁碟剩餘空間。"
 
       - alert: KafkaJvmGcPauseHigh
         expr: rate(jvm_gc_collectiontime[5m]) / 1000 > 0.1
@@ -253,7 +268,6 @@ cat >&2 <<EOF
     3. 把 prometheus-scrape.yml 併入 prometheus.yml
     4. 把 kafka-alerts.yml 放進 Prometheus 的 rule_files
 
-  沒有 Prometheus 也能看單一指標：
-    echo 'get -b kafka.server:type=ReplicaManager,name=UnderReplicatedPartitions Value' \\
-      | ${KAFKA_HOME}/bin/kafka-run-class.sh kafka.tools.JmxTool --jmx-url service:jmx:rmi:///jndi/rmi://localhost:9999/jmxrmi
+  沒有 Prometheus 也能看單一指標（直接打 jmx_exporter 的 HTTP 端點）：
+    curl -s localhost:${EXPORTER_PORT}/metrics | grep -i underreplicated
 EOF

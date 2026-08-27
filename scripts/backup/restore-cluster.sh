@@ -77,7 +77,8 @@ cluster_ready || die "目標叢集 ${TARGET} 無法連線，請先啟動"
 EXISTING="$(kafka_topics --list 2>/dev/null | grep -vc '^__' || true)"
 if (( EXISTING > 0 )); then
   log_warn "目標叢集已有 ${EXISTING} 個使用者 topic。"
-  log_warn "重建使用 --if-not-exists，既有 topic 不會被覆蓋，但設定可能被 --alter 改動。"
+  log_warn "重建使用 --if-not-exists（既有 topic 的 partition/RF 不會被改動），"
+  log_warn "但步驟 3/5 會把備份中的 topic 設定以 --alter 套用到既有 topic 上。"
 fi
 confirm "確定要對 ${TARGET} 執行還原嗎？" || die "已取消"
 
@@ -90,8 +91,19 @@ if [[ -f "${BROKER_CFG}" ]]; then
   while IFS= read -r line; do
     # 範例： retention.ms=604800000 sensitive=false synonyms={DYNAMIC_BROKER_CONFIG:...}
     [[ "${line}" == *"DYNAMIC_BROKER_CONFIG"* ]] || continue
-    KV="$(awk '{print $1}' <<<"${line}")"
+    # 抓「name=value」整段直到 sensitive= 標記為止——值可能含空白或逗號，
+    # 不能用 awk '{print $1}'（那會把值截斷）
+    KV="$(sed -nE 's/^ *([^ ]+=.*[^ ]) +sensitive=(true|false).*/\1/p;t;s/^ *([^ ]+=[^ ]*) +sensitive=(true|false).*/\1/p' <<<"${line}")"
     [[ "${KV}" == *=* ]] || continue
+    # 敏感設定（密碼類）--describe 只會顯示 name=null，還原它會把密碼設成字串 "null"
+    if [[ "${line}" == *" sensitive=true"* || "${KV#*=}" == "null" ]]; then
+      log_warn "  略過敏感／不可讀取的設定：${KV%%=*}（請於還原後手動設定）"
+      continue
+    fi
+    # 值含逗號時要用 [] 包起來，否則 --add-config 會把它拆成多個設定
+    if [[ "${KV#*=}" == *,* ]]; then
+      KV="${KV%%=*}=[${KV#*=}]"
+    fi
     log_info "  broker config：${KV}"
     kafka_configs --entity-type brokers --entity-default --alter --add-config "${KV}" >/dev/null 2>&1 \
       && RESTORED=$(( RESTORED + 1 )) || log_warn "  設定失敗（可能為唯讀參數）：${KV}"
@@ -107,20 +119,54 @@ if [[ "${DRY_RUN}" == "true" ]]; then
   log_info "[DRY-RUN] 會執行 ${FROM}/topics/recreate-topics.sh"
   sed -n '1,40p' "${FROM}/topics/recreate-topics.sh" | sed 's/^/    /' >&2
 else
+  # 先收集輸出、再過濾顯示：直接接在 pipeline 上的話，
+  # (a) recreate 部分失敗會讓 pipefail 中斷整個還原（應該繼續其餘步驟）
+  # (b) 零 topic 的備份輸出為空，grep -v 會以 exit 1 假失敗
+  RECREATE_LOG="$(mktemp)"
+  RECREATE_RC=0
   BOOTSTRAP_SERVERS="${TARGET}" KAFKA_HOME="${KAFKA_HOME}" \
-    bash "${FROM}/topics/recreate-topics.sh" 2>&1 | grep -v 'Picked up' | sed 's/^/  /' >&2
-  log_ok "topic 重建完成"
+    bash "${FROM}/topics/recreate-topics.sh" > "${RECREATE_LOG}" 2>&1 || RECREATE_RC=$?
+  { grep -v 'Picked up' "${RECREATE_LOG}" || true; } | sed 's/^/  /' >&2
+  rm -f "${RECREATE_LOG}"
+  if (( RECREATE_RC == 0 )); then
+    log_ok "topic 重建完成"
+  else
+    log_warn "部分 topic 建立失敗（見上方清單）；繼續進行其餘還原步驟"
+  fi
 fi
 
 # -----------------------------------------------------------------------------
-section "3/5 核對 topic 設定"
+section "3/5 套用並核對 topic 設定"
+# --if-not-exists 對「既有」topic 不會套用任何設定，
+# 這裡把備份中的 topic 設定用 --alter 明確套上（新建的 topic 套用同值屬 no-op）
+CFG_APPLIED=0
+if [[ "${DRY_RUN}" != "true" ]]; then
+  while IFS= read -r t; do
+    [[ -z "${t}" || "${t}" == __* ]] && continue
+    kafka_topics --describe --topic "${t}" >/dev/null 2>&1 || continue   # 建立失敗的跳過
+    CFG="$(awk '/^Topic: /{for(i=1;i<=NF;i++) if($i=="Configs:") {print $(i+1); exit}}' \
+             "${FROM}/topics/${t//\//_}.describe" 2>/dev/null || true)"
+    [[ -n "${CFG}" && "${CFG}" != "Configs:" ]] || continue
+    # 逗號只在「後面接 key= 」時才是設定分隔符；值內的逗號（如 1:0,2:0）要保留
+    while IFS= read -r kv; do
+      [[ -z "${kv}" || "${kv}" != *=* ]] && continue
+      VAL="${kv#*=}"
+      [[ "${VAL}" == *,* ]] && kv="${kv%%=*}=[${VAL}]"
+      kafka_configs --entity-type topics --entity-name "${t}" --alter --add-config "${kv}" >/dev/null 2>&1 \
+        && CFG_APPLIED=$(( CFG_APPLIED + 1 )) \
+        || log_warn "  ${t}：套用 ${kv%%=*} 失敗"
+    done < <(sed -E 's/,([a-zA-Z0-9._-]+=)/\n\1/g' <<<"${CFG}")
+  done < "${FROM}/topics/topic-list.txt"
+  log_ok "套用 ${CFG_APPLIED} 項 topic 設定"
+fi
+
 DIFF_COUNT=0
 while IFS= read -r t; do
   [[ -z "${t}" || "${t}" == __* ]] && continue
   EXPECT="$(awk '/^Topic: /{print $6"/"$8; exit}' "${FROM}/topics/${t//\//_}.describe" 2>/dev/null || echo "")"
   ACTUAL="$(kafka_topics --describe --topic "${t}" 2>/dev/null | awk '/^Topic: /{print $6"/"$8; exit}')"
   if [[ "${EXPECT}" != "${ACTUAL}" ]]; then
-    log_warn "  ${t}：partition/RF 預期 ${EXPECT}，實際 ${ACTUAL:-<不存在>}"
+    log_warn "  ${t}：partition/RF 預期 ${EXPECT:-<備份缺 describe>}，實際 ${ACTUAL:-<不存在>}"
     DIFF_COUNT=$(( DIFF_COUNT + 1 ))
   fi
 done < "${FROM}/topics/topic-list.txt"
@@ -153,10 +199,17 @@ elif [[ -f "${FROM}/groups/restore-offsets.sh" ]]; then
     if [[ "${DRY_RUN}" == "true" ]]; then
       log_info "[DRY-RUN] 會執行 restore-offsets.sh"
     else
+      OFFSET_LOG="$(mktemp)"
+      OFFSET_RC=0
       BOOTSTRAP_SERVERS="${TARGET}" KAFKA_HOME="${KAFKA_HOME}" \
-        bash "${FROM}/groups/restore-offsets.sh" 2>&1 | grep -v 'Picked up' | sed 's/^/  /' >&2 \
-        || log_warn "部分 group 還原失敗（可能該 group 尚未存在，或 offset 超出範圍）"
-      log_ok "offset 還原完成"
+        bash "${FROM}/groups/restore-offsets.sh" > "${OFFSET_LOG}" 2>&1 || OFFSET_RC=$?
+      { grep -v 'Picked up' "${OFFSET_LOG}" || true; } | sed 's/^/  /' >&2
+      rm -f "${OFFSET_LOG}"
+      if (( OFFSET_RC == 0 )); then
+        log_ok "offset 還原完成"
+      else
+        log_warn "部分 group 還原失敗（見上方清單；可能 topic 不存在或 offset 超出範圍）"
+      fi
     fi
   else
     log_info "已略過 offset 還原。稍後可單獨執行："

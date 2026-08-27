@@ -6,14 +6,17 @@
 # 啟動：
 #   docker compose -f docker/docker-compose.dr.yml up -d
 #
-# 主叢集   -> localhost:19092  （別名 dc1）
-# 備援叢集 -> localhost:29092  （別名 dc2）
+# 主叢集   -> localhost:18092  （別名 dc1）
+# 備援叢集 -> localhost:28092  （別名 dc2）
+# （port 刻意與三節點練習環境的 19092/29092/39092 錯開，兩套可同時存在）
 #
 # 演練：
-#   BOOTSTRAP_SERVERS=localhost:19092 ./scripts/test/smoke-test.sh
-#   ./scripts/dr/dr-status.sh --source-alias dc1 --source localhost:19092 --target localhost:29092
-#   ./scripts/dr/failover.sh --source-alias dc1 --source localhost:19092 \
-#                            --target-alias dc2 --target localhost:29092 --drill
+#   BOOTSTRAP_SERVERS=localhost:18092 ./scripts/test/smoke-test.sh
+#   ./scripts/dr/setup-mirrormaker.sh --source-alias dc1 --source localhost:18092 \
+#                                     --target-alias dc2 --target localhost:28092 --rf 1 --start
+#   ./scripts/dr/dr-status.sh --source-alias dc1 --source localhost:18092 --target localhost:28092
+#   ./scripts/dr/failover.sh --source-alias dc1 --source localhost:18092 \
+#                            --target-alias dc2 --target localhost:28092 --drill
 # =============================================================================
 
 x-kafka-common: &kafka-common
@@ -32,14 +35,14 @@ services:
     <<: *kafka-common
     container_name: dc1-kafka
     hostname: dc1-kafka
-    ports: ["19092:19092"]
+    ports: ["18092:18092"]
     environment:
       KAFKA_NODE_ID: 1
       KAFKA_PROCESS_ROLES: broker,controller
       KAFKA_CONTROLLER_QUORUM_VOTERS: 1@dc1-kafka:9093
       KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
-      KAFKA_LISTENERS: INTERNAL://:9092,CONTROLLER://:9093,EXTERNAL://:19092
-      KAFKA_ADVERTISED_LISTENERS: INTERNAL://dc1-kafka:9092,EXTERNAL://localhost:19092
+      KAFKA_LISTENERS: INTERNAL://:9092,CONTROLLER://:9093,EXTERNAL://:18092
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://dc1-kafka:9092,EXTERNAL://localhost:18092
       KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT
       KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
@@ -48,7 +51,11 @@ services:
       KAFKA_SHARE_COORDINATOR_STATE_TOPIC_REPLICATION_FACTOR: 1
       KAFKA_SHARE_COORDINATOR_STATE_TOPIC_MIN_ISR: 1
       KAFKA_HEAP_OPTS: -Xmx512M -Xms512M
-      CLUSTER_ID: dr-demo-dc1-cluster
+      # 一定要指向 volume 掛載點：映像檔預設寫 /tmp/kafka-logs（可寫層），
+      # 不設這個的話 volume 形同虛設，down 之後資料就沒了
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+      # cluster id 必須是 22 字元的 base64url 字串（KRaft 的 UUID 格式）
+      CLUSTER_ID: dr-demo-dc1-cluster-00
     volumes: ["dc1-data:/var/lib/kafka/data"]
     networks: [dr-net]
 
@@ -57,14 +64,14 @@ services:
     <<: *kafka-common
     container_name: dc2-kafka
     hostname: dc2-kafka
-    ports: ["29092:29092"]
+    ports: ["28092:28092"]
     environment:
       KAFKA_NODE_ID: 1
       KAFKA_PROCESS_ROLES: broker,controller
       KAFKA_CONTROLLER_QUORUM_VOTERS: 1@dc2-kafka:9093
       KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
-      KAFKA_LISTENERS: INTERNAL://:9092,CONTROLLER://:9093,EXTERNAL://:29092
-      KAFKA_ADVERTISED_LISTENERS: INTERNAL://dc2-kafka:9092,EXTERNAL://localhost:29092
+      KAFKA_LISTENERS: INTERNAL://:9092,CONTROLLER://:9093,EXTERNAL://:28092
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://dc2-kafka:9092,EXTERNAL://localhost:28092
       KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT
       KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
@@ -73,7 +80,8 @@ services:
       KAFKA_SHARE_COORDINATOR_STATE_TOPIC_REPLICATION_FACTOR: 1
       KAFKA_SHARE_COORDINATOR_STATE_TOPIC_MIN_ISR: 1
       KAFKA_HEAP_OPTS: -Xmx512M -Xms512M
-      CLUSTER_ID: dr-demo-dc2-cluster
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+      CLUSTER_ID: dr-demo-dc2-cluster-00
     volumes: ["dc2-data:/var/lib/kafka/data"]
     networks: [dr-net]
 
