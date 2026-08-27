@@ -93,11 +93,13 @@ RECREATE="${BACKUP_DIR}/topics/recreate-topics.sh"
   echo '#!/usr/bin/env bash'
   echo '# 由 backup-cluster.sh 自動產生：重建所有 topic 的定義（不含資料）'
   echo '# 用法：BOOTSTRAP_SERVERS=new-cluster:9092 bash recreate-topics.sh'
+  echo '# 單一 topic 失敗（例如目標叢集 broker 數少於 RF）不會中斷其他 topic，'
+  echo '# 全部嘗試完之後統一回報失敗清單。'
   echo 'set -Eeuo pipefail'
   echo 'BOOTSTRAP_SERVERS="${BOOTSTRAP_SERVERS:-localhost:9092}"'
   echo 'KAFKA_HOME="${KAFKA_HOME:-'"${KAFKA_HOME}"'}"'
   echo 'T="${KAFKA_HOME}/bin/kafka-topics.sh"'
-  echo 'C="${KAFKA_HOME}/bin/kafka-configs.sh"'
+  echo 'FAILED=0; FAILED_TOPICS=""'
   echo ''
 } > "${RECREATE}"
 
@@ -125,13 +127,24 @@ while IFS= read -r t; do
         printf ' \\\n  --config %q' "${kv}"
       done
     fi
-    printf '\n\n'
+    printf ' \\\n  || { echo "  ✘ 建立失敗：%q" >&2; FAILED=$((FAILED+1)); FAILED_TOPICS="${FAILED_TOPICS} %q"; }\n\n' "${t}" "${t}"
   } >> "${RECREATE}"
 
   # 完整副本配置（哪個 partition 放在哪些 broker）另存，供需要保持配置一致時使用
   kafka_topics --describe --topic "${t}" 2>/dev/null > "${BACKUP_DIR}/topics/${t//\//_}.describe" || true
   TOPIC_COUNT=$(( TOPIC_COUNT + 1 ))
 done < "${BACKUP_DIR}/topics/topic-list.txt"
+
+{
+  echo 'if (( FAILED > 0 )); then'
+  echo '  echo "" >&2'
+  echo '  echo "⚠ ${FAILED} 個 topic 建立失敗（其餘皆已嘗試）：${FAILED_TOPICS# }" >&2'
+  echo '  echo "  常見原因：目標叢集 broker 數少於備份來源的 replication factor。" >&2'
+  echo '  echo "  可用較低 RF 手動重建這些 topic，或先擴充目標叢集。" >&2'
+  echo '  exit 1'
+  echo 'fi'
+  echo 'echo "所有 topic 建立完成"'
+} >> "${RECREATE}"
 
 chmod +x "${RECREATE}"
 log_ok "${TOPIC_COUNT} 個使用者 topic，已產生 recreate-topics.sh"
@@ -148,10 +161,12 @@ RESET="${BACKUP_DIR}/groups/restore-offsets.sh"
   echo '# 由 backup-cluster.sh 自動產生：把 consumer group offset 還原到備份當下的位置'
   echo '# 前提：目標叢集已有相同的 topic，且該 group 的 consumer 全部停止'
   echo '# 用法：BOOTSTRAP_SERVERS=new-cluster:9092 bash restore-offsets.sh'
+  echo '# 單一 group 失敗不會中斷其他 group，全部嘗試完之後統一回報。'
   echo 'set -Eeuo pipefail'
   echo 'BOOTSTRAP_SERVERS="${BOOTSTRAP_SERVERS:-localhost:9092}"'
   echo 'KAFKA_HOME="${KAFKA_HOME:-'"${KAFKA_HOME}"'}"'
   echo 'G="${KAFKA_HOME}/bin/kafka-consumer-groups.sh"'
+  echo 'FAILED=0'
   echo ''
 } > "${RESET}"
 
@@ -170,11 +185,20 @@ while IFS= read -r g; do
     {
       printf 'echo "還原 group %s"\n' "${g}"
       printf '"${G}" --bootstrap-server "${BOOTSTRAP_SERVERS}" --group %q \\\n' "${g}"
-      printf '  --reset-offsets --from-file "$(dirname "$0")/%s" --execute\n\n' "$(basename "${CSV}")"
+      printf '  --reset-offsets --from-file "$(dirname "$0")/%s" --execute \\\n' "$(basename "${CSV}")"
+      printf '  || { echo "  ✘ 還原失敗：%q（topic 不存在或 group 仍有 active consumer？）" >&2; FAILED=$((FAILED+1)); }\n\n' "${g}"
     } >> "${RESET}"
     GROUP_TOTAL=$(( GROUP_TOTAL + 1 ))
   fi
 done < "${BACKUP_DIR}/groups/group-list.txt"
+
+{
+  echo 'if (( FAILED > 0 )); then'
+  echo '  echo "⚠ ${FAILED} 個 group 還原失敗（其餘皆已嘗試）" >&2'
+  echo '  exit 1'
+  echo 'fi'
+  echo 'echo "所有 group offset 還原完成"'
+} >> "${RESET}"
 
 chmod +x "${RESET}"
 log_ok "${GROUP_TOTAL} 個 group 的 offset"

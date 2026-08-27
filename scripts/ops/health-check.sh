@@ -47,6 +47,9 @@ record() {   # record <name> <status> <message>
     CRIT) (( SEVERITY < 2 )) && SEVERITY=2 ;;
     WARN) (( SEVERITY < 1 )) && SEVERITY=1 ;;
   esac
+  # 一定要 return 0：上面的 (( )) 在 SEVERITY 已達上限時會回傳 1，
+  # 沒有這行的話 set -e 會在「第二個非 OK 檢查」時殺掉整個腳本
+  return 0
 }
 
 emit_text() {
@@ -167,7 +170,8 @@ if (( CG_COUNT > 0 )); then
   while IFS= read -r g; do
     [[ -z "${g}" ]] && continue
     local_lag="$(kafka_groups --describe --group "${g}" 2>/dev/null \
-      | awk '$6 ~ /^[0-9]+$/ {s+=$6} END{print s+0}')"
+      | awk '$6 ~ /^[0-9]+$/ {s+=$6} END{print s+0}' || true)"
+    [[ -n "${local_lag}" ]] || local_lag=0   # group 剛被刪除等暫時性失敗不該中斷整個檢查
     if (( local_lag > LAG_THRESHOLD )); then
       HIGH_LAG_GROUPS="${HIGH_LAG_GROUPS} ${g}(${local_lag})"
     fi

@@ -8,43 +8,49 @@
 #
 # 注意：conf/kafka-env.sh 已被 .gitignore 排除，可放環境相依的值，
 #       但「不要」在這裡放密碼；密碼請放 conf/security/ 並限制檔案權限。
+#
+# 重要：所有變數都必須用 ${VAR:-預設值} 的形式，讓命令列上的環境變數
+#       仍然可以覆寫這個檔案（優先序：環境變數 > 本檔 > 腳本內建預設）。
+#       直接寫 export VAR="value" 會反過來蓋掉命令列的值——
+#       例如 DRY_RUN=true ./scripts/... 會被本檔的 DRY_RUN=false 覆蓋，
+#       以為在預演、實際在執行。
 # =============================================================================
 
 # ---- 版本 --------------------------------------------------------------------
-# 已驗證版本：4.1.2 / 4.2.1 / 4.3.1（皆為 KRaft-only）
-export KAFKA_VERSION="4.1.2"
-export SCALA_VERSION="2.13"
+export KAFKA_VERSION="${KAFKA_VERSION:-4.1.2}"
+export SCALA_VERSION="${SCALA_VERSION:-2.13}"
 
 # ---- 安裝路徑 ----------------------------------------------------------------
 # 正式環境建議：KAFKA_BASE_DIR=/opt/kafka，資料放獨立磁碟 KAFKA_DATA_DIR=/data/kafka
-export KAFKA_BASE_DIR="${HOME}/kafka"
-export KAFKA_HOME="${KAFKA_BASE_DIR}/current"
-export KAFKA_DATA_DIR="${KAFKA_BASE_DIR}/data"
-export KAFKA_LOG_DIR="${KAFKA_BASE_DIR}/logs"
-export KAFKA_CONF_DIR="${KAFKA_BASE_DIR}/conf"
-export KAFKA_BACKUP_DIR="${KAFKA_BASE_DIR}/backups"
+export KAFKA_BASE_DIR="${KAFKA_BASE_DIR:-${HOME}/kafka}"
+export KAFKA_HOME="${KAFKA_HOME:-${KAFKA_BASE_DIR}/current}"
+export KAFKA_DATA_DIR="${KAFKA_DATA_DIR:-${KAFKA_BASE_DIR}/data}"
+export KAFKA_LOG_DIR="${KAFKA_LOG_DIR:-${KAFKA_BASE_DIR}/logs}"
+export KAFKA_CONF_DIR="${KAFKA_CONF_DIR:-${KAFKA_BASE_DIR}/conf}"
+export KAFKA_BACKUP_DIR="${KAFKA_BACKUP_DIR:-${KAFKA_BASE_DIR}/backups}"
 
 # ---- 連線 --------------------------------------------------------------------
-export BOOTSTRAP_SERVERS="localhost:9092"
+export BOOTSTRAP_SERVERS="${BOOTSTRAP_SERVERS:-localhost:9092}"
 
 # 若叢集啟用 SASL / TLS，指向 client 設定檔（見 conf/security/）
-# export KAFKA_CLIENT_CONFIG="${PWD}/conf/security/client.properties"
+# 用 ${REPO_ROOT}（common.sh 已先設好）而非 ${PWD}，避免換目錄執行時悄悄失效
+# export KAFKA_CLIENT_CONFIG="${KAFKA_CLIENT_CONFIG:-${REPO_ROOT}/conf/security/client.properties}"
 
 # ---- JVM ---------------------------------------------------------------------
 # 準則：heap 4–8G 就夠，其餘記憶體留給 OS page cache
-export KAFKA_HEAP_OPTS="-Xmx2G -Xms2G"
+export KAFKA_HEAP_OPTS="${KAFKA_HEAP_OPTS:--Xmx2G -Xms2G}"
 
 # ---- 叢集拓撲（多節點安裝時使用）---------------------------------------------
 # 逗號分隔的 node.id@host:port 清單，controller quorum 用
-# export CONTROLLER_QUORUM_VOTERS="1@kafka-1:9093,2@kafka-2:9093,3@kafka-3:9093"
-# export NODE_ID="1"
-# export ADVERTISED_HOST="kafka-1.internal"
+# export CONTROLLER_QUORUM_VOTERS="${CONTROLLER_QUORUM_VOTERS:-1@kafka-1:9093,2@kafka-2:9093,3@kafka-3:9093}"
+# export NODE_ID="${NODE_ID:-1}"
+# export ADVERTISED_HOST="${ADVERTISED_HOST:-kafka-1.internal}"
 
 # ---- 備份 --------------------------------------------------------------------
-export BACKUP_RETENTION_DAYS="14"
+export BACKUP_RETENTION_DAYS="${BACKUP_RETENTION_DAYS:-14}"
 # 可選：備份完成後同步到物件儲存（需先安裝並設定好對應 CLI）
-# export BACKUP_REMOTE_URI="s3://my-bucket/kafka-backups"
+# export BACKUP_REMOTE_URI="${BACKUP_REMOTE_URI:-s3://my-bucket/kafka-backups}"
 
 # ---- 行為 --------------------------------------------------------------------
-export LOG_LEVEL="info"     # debug | info | warn | error
-export DRY_RUN="false"
+export LOG_LEVEL="${LOG_LEVEL:-info}"     # debug | info | warn | error
+export DRY_RUN="${DRY_RUN:-false}"

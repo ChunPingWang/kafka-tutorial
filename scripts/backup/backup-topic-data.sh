@@ -17,7 +17,10 @@
 #     且用支援帶入 timestamp 的 producer）
 #   - headers 不會保留（console producer 不支援）
 #   - partition 落點靠 key 雜湊；只有在「目標 topic 的 partition 數相同」時才會一致
-#   - 二進位訊息（Avro/Protobuf）請改用 --format base64
+#   - 本工具是「一行一筆」的文字格式：value 含換行、key 含 Tab、
+#     或二進位訊息（Avro/Protobuf）都「無法」用本工具匯出。
+#     匯出時偵測到換行會直接失敗（不會靜默截斷）；這類 topic 請改用
+#     MirrorMaker 2（scripts/dr/）或 Kafka Connect。
 #
 # 用法：
 #   匯出：./scripts/backup/backup-topic-data.sh export <topic> [--max N] [--out DIR]
@@ -53,6 +56,10 @@ export)
       *) die "未知選項：$1" ;;
     esac
   done
+  # 誠實面對限制：base64 等格式尚未實作，接受參數再輸出 raw text 會造成
+  # 「以為備份了二進位資料」的假象，比直接拒絕更危險
+  [[ "${FORMAT}" == "text" ]] \
+    || die "--format ${FORMAT} 尚未實作（目前僅支援 text）。二進位 topic 請改用 MirrorMaker 2 或 Kafka Connect。"
 
   cluster_ready || die "叢集無法連線"
   mkdir -p "${OUT_DIR}"
@@ -133,6 +140,17 @@ EOF
 
   # 原始格式： CreateTime:<ts>\tPartition:<p>\tOffset:<o>\t<key>\t<value>
   # 正規化成： <partition>\t<offset>\t<timestamp>\t<key>\t<value>
+  #
+  # value 含換行的訊息會在 console consumer 的輸出裡變成「多行」，
+  # 續行沒有 ts/partition/offset 前綴（欄位數 < 5）。這種資料一旦匯出
+  # 就是靜默截斷——所以這裡改成偵測到就直接失敗，不產出損毀的備份。
+  MALFORMED="$(awk -F'\t' 'NF < 5 || $1 !~ /^[A-Za-z]+:-?[0-9]+$/' "${OUT_FILE}.raw" | grep -c . || true)"
+  if (( MALFORMED > 0 )); then
+    rm -f "${OUT_FILE}.raw" "${OUT_FILE}" "${META_FILE}"
+    die "匯出中止：有 ${MALFORMED} 行無法解析（value 含換行或二進位內容）。
+  這個 topic 不適合用本工具做行式文字匯出，請改用 MirrorMaker 2（scripts/dr/）。
+  未產出任何備份檔，避免留下看似完整、實際截斷的資料。"
+  fi
   awk -F'\t' 'NF>=5 {
       ts = $1; sub(/^[A-Za-z]+:/, "", ts)
       p  = $2; sub(/^Partition:/, "", p)

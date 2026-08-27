@@ -110,6 +110,12 @@ INTER_BROKER_LISTENER_NAME="PLAINTEXT"
 if [[ "${ROLES}" == "controller" ]]; then
   LISTENERS="CONTROLLER://:${CONTROLLER_PORT}"
   ADVERTISED_LISTENERS=""
+elif [[ ",${ROLES}," != *",controller,"* ]]; then
+  # broker-only 節點：listeners「不能」包含 controller listener，
+  # 否則 KRaft 啟動驗證會直接拒絕（controller.listener.names 裡的 listener
+  # 只允許出現在有 controller 角色的節點上）。
+  # controller.listener.names 與 quorum voters 仍需保留，broker 才找得到 controller。
+  LISTENERS="PLAINTEXT://:${BROKER_PORT}"
 fi
 
 section "安裝參數"
