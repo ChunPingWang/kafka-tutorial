@@ -47,6 +47,7 @@
 - [C. 上線檢查清單](#附錄-c上線檢查清單)
 - [D. 常見錯誤訊息對照表](#附錄-d常見錯誤訊息對照表)
 - [E. 本手冊的驗證環境](#附錄-e本手冊的驗證環境)
+- [F. VM 佈署實戰：從裸機到通過驗證](#附錄-fvm-佈署實戰從裸機到通過驗證)
 
 ---
 
@@ -655,6 +656,142 @@ client.rack=az-a
 | 不同的合規要求 | 個資與非個資分開，稽核範圍才好界定 |
 | 跨地域 | 跨洲的副本同步延遲不可接受，應該用 MM2 複寫 |
 | 單叢集超過 ~15 台 | 維運複雜度上升快，考慮拆分 |
+
+### 6.5 C4 模型：Kafka 與周邊組件的關係
+
+拓撲設計的最後一步，是把「Kafka 本身」和「圍繞它的一切」畫在同一張圖上。
+下面用 [C4 Model](https://c4model.com/) 的前三層描述本手冊建立的完整系統——
+你交給主管或新同事的架構說明，基本上就是這三張圖。
+
+#### Level 1：系統情境圖（System Context）
+
+先回答「誰在用 Kafka、Kafka 又依賴誰」。
+
+```mermaid
+C4Context
+  title Kafka 事件串流平台 — 系統情境圖
+
+  Person(app_dev, "應用開發者", "撰寫 producer / consumer 應用")
+  Person(ops, "維運工程師", "使用本手冊的腳本進行安裝、監控、備份與災難切換")
+
+  System(kafka, "Kafka 事件串流平台", "3 節點 KRaft 叢集：RF=3、min.insync.replicas=2、acks=all")
+
+  System_Ext(producers, "上游系統", "訂單、IoT、CDC 等事件來源（producer）")
+  System_Ext(consumers, "下游系統", "庫存、通知、報表等服務（consumer group）")
+  System_Ext(monitoring, "監控平台", "Prometheus + Grafana + Alertmanager")
+  System_Ext(dr, "備援叢集（DR）", "另一個資料中心的 Kafka 叢集")
+
+  Rel(producers, kafka, "寫入事件", "Kafka protocol :9092")
+  Rel(consumers, kafka, "拉取事件、提交 offset", "Kafka protocol :9092")
+  Rel(app_dev, producers, "開發")
+  Rel(app_dev, consumers, "開發")
+  Rel(ops, kafka, "腳本化維運", "scripts/ops、scripts/backup")
+  Rel(monitoring, kafka, "抓取 JMX 指標", "HTTP :7071 /metrics")
+  Rel(kafka, dr, "MirrorMaker 2 非同步複寫", "topic + consumer offset")
+
+  UpdateLayoutConfig($c4ShapeInRow="3", $c4BoundaryInRow="1")
+```
+
+讀圖重點：
+
+- **事件的流向只有一種**：上游寫入、下游拉取，兩者透過 Kafka 完全解耦，互相不知道對方存在（第 1 章的核心價值）。
+- **監控是拉（pull）模式**：Prometheus 主動來抓 :7071，broker 不需要對外推送任何東西。
+- **DR 複寫是非同步的**：主叢集掛掉的瞬間，尚未複寫的訊息就是你的 RPO（第 22–24 章）。
+
+#### Level 2：容器圖（Container）
+
+放大「Kafka 事件串流平台」這個框，看看裡面有哪些會獨立執行的東西。
+這張圖同時就是 `docker/docker-compose.yml` 練習環境與正式環境的對照。
+
+```mermaid
+C4Container
+  title Kafka 事件串流平台 — 容器圖
+
+  System_Ext(clients, "Producer / Consumer 應用", "使用 examples/ 的建議設定")
+  Person(ops, "維運工程師")
+
+  Container_Boundary(cluster, "Kafka 叢集（KRaft combined mode）") {
+    Container(b1, "kafka-1", "broker + controller", "listener :9092 / controller :9093 / JMX exporter :7071")
+    Container(b2, "kafka-2", "broker + controller", "同左，node.id=2")
+    Container(b3, "kafka-3", "broker + controller", "同左，node.id=3")
+  }
+
+  Container_Boundary(tooling, "維運與觀測工具") {
+    Container(scripts, "維運腳本", "bash", "scripts/{install,ops,backup,test,dr}：健康檢查、滾動重啟、備份、故障演練")
+    Container(ui, "Kafka UI", "web", "瀏覽 topic、訊息、consumer lag（:8080）")
+    Container(mm2, "MirrorMaker 2", "connect-mirror-maker.sh", "把 topic 與 consumer offset 複寫到 DR 叢集")
+  }
+
+  ContainerDb(backup, "備份儲存", "本機目錄 / S3 / GCS / Azure", "metadata 備份 tarball：topic 定義、設定、offset")
+  System_Ext(dr, "備援叢集（DR）")
+  System_Ext(prom, "Prometheus")
+
+  Rel(clients, b1, "讀寫", ":9092")
+  BiRel(b1, b2, "副本同步 + Raft quorum")
+  BiRel(b2, b3, "副本同步 + Raft quorum")
+  BiRel(b1, b3, "副本同步 + Raft quorum")
+  Rel(ops, scripts, "執行")
+  Rel(scripts, b1, "Kafka CLI", ":9092")
+  Rel(scripts, backup, "備份 / 還原 / 驗證")
+  Rel(ui, b1, "讀取 metadata 與訊息")
+  Rel(mm2, b1, "consume（來源）")
+  Rel(mm2, dr, "produce（目標）")
+  Rel(prom, b1, "scrape", ":7071")
+
+  UpdateLayoutConfig($c4ShapeInRow="3", $c4BoundaryInRow="2")
+```
+
+讀圖重點：
+
+- **三台 broker 彼此對等**：每一台都同時是 broker（存資料）和 controller quorum 的投票者（第 4 章）。
+  圖上畫到 kafka-1 的連線，實際上對三台都成立——client 會自己找到每個 partition 的 leader。
+- **MirrorMaker 2 是獨立行程**，不是 broker 的一部分。它本質上是「一個 consumer 加一個 producer」，
+  掛掉不影響主叢集，只影響 RPO。
+- **備份儲存的內容是 metadata**（topic 定義、設定、offset），不是訊息本體——
+  訊息本體的「備份」靠的是 RF=3 與 MM2 複寫（第 20 章的核心觀念）。
+
+#### Level 3：組件圖（Component）—— 單一 broker 內部
+
+最後放大一台 broker。日常維運不需要記住這張圖，
+但在讀第 16 章的監控指標與第 19 章的故障排除時，它能幫你把指標對應到位置。
+
+```mermaid
+C4Component
+  title kafka-1 — broker 內部組件圖
+
+  Container_Boundary(broker, "kafka-1（JVM 行程）") {
+    Component(listener, "Listeners / 網路層", "num.network.threads", "接收 client 與其他 broker 的請求（:9092、:9093）")
+    Component(replica, "ReplicaManager", "num.io.threads", "讀寫 partition、追蹤 ISR、推進 high watermark")
+    Component(coord, "Group / Txn Coordinator", "", "管理 consumer group 與 __consumer_offsets、交易狀態")
+    Component(raft, "KRaft Controller", "Raft", "叢集 metadata 的複製狀態機（__cluster_metadata）")
+    Component(log, "Log / Segment 管理", "retention、compaction", "append-only 寫入 segment 檔，過期刪除")
+  }
+
+  ComponentDb(disk, "資料目錄", "log.dirs", "segment / index 檔案，經 OS page cache 寫入")
+  System_Ext(peer, "其他 broker（kafka-2 / kafka-3）")
+
+  Rel(listener, replica, "produce / fetch 請求")
+  Rel(listener, coord, "offset commit、join group")
+  Rel(replica, log, "讀寫訊息")
+  Rel(log, disk, "循序 I/O（page cache）")
+  Rel(raft, peer, "metadata 複寫與選舉", ":9093")
+  Rel(peer, replica, "follower fetch（副本同步）", ":9092")
+
+  UpdateLayoutConfig($c4ShapeInRow="2", $c4BoundaryInRow="1")
+```
+
+讀圖重點（對應監控章節）：
+
+| 組件 | 出問題時的症狀 | 對應指標（第 16 章） |
+|---|---|---|
+| 網路層 | 請求排隊、延遲上升 | `NetworkProcessorAvgIdlePercent` |
+| ReplicaManager | ISR 縮減、URP > 0 | `UnderReplicatedPartitions`、`IsrShrinksPerSec` |
+| KRaft Controller | 選不出 leader、metadata 操作卡住 | `current-state`、quorum lag |
+| Log / 磁碟 | 寫入變慢、磁碟寫滿直接停止服務 | log size、磁碟使用率 |
+
+> **提醒**：C4 圖是「溝通工具」，不是「維護負擔」。
+> 拓撲改變時（加 broker、加叢集、換監控），記得回來改這三張圖——
+> 一張過時的架構圖比沒有圖更危險。
 
 ---
 
@@ -2733,7 +2870,8 @@ scripts/
 │   └── common.sh                共用函式庫：logging、retry、Kafka CLI 包裝、設定載入
 ├── install/
 │   ├── preflight.sh             安裝前環境檢查（9 大類）
-│   └── install-kafka.sh         下載、校驗、設定、KRaft 格式化、啟動
+│   ├── install-kafka.sh         下載、校驗、設定、KRaft 格式化、啟動
+│   └── deploy-vm.sh             VM 正式佈署：服務帳號 + systemd + OS 調校 + 驗證（附錄 F）
 ├── test/
 │   ├── smoke-test.sh            10 個區段、14 項核心功能斷言
 │   ├── perf-test.sh             多情境吞吐與延遲基準
@@ -2912,13 +3050,194 @@ scripts/
 - ✅ `dr-status.sh` / `failover.sh`：演練模式與真實切換
 - ✅ `run-all-tests.sh`：6 個階段全數通過
 
-**未在此環境驗證的項目（環境限制，非腳本問題）：**
+**後續補驗證（2026-08-27，WSL2 VM / Fedora 44）：**
 
-- ⚠️ `docker/docker-compose.yml`：compose 檔語法已驗證，但驗證環境的網路政策封鎖了
-  Docker Hub 的映像檔 CDN，無法實際拉取 `apache/kafka:4.1.2` 映像。
-  多節點行為改以「同一台機器上的三個原生 broker」驗證。
-- ⚠️ `rolling-restart.sh --hosts`：需要多台主機與 SSH，此環境為單機。
-- ⚠️ TLS / SASL / ACL：設定範例來自官方文件，未在此環境架設 CA 實測。
+- ✅ `docker/docker-compose.yml`：實際拉取 `apache/kafka:4.1.2` 並啟動三節點叢集，
+  `run-all-tests.sh --quick` 六階段全數通過、`resilience-test.sh --docker` 10/10 通過
+  （實測單機故障 MTTR 6 秒）。
+- ✅ `deploy-vm.sh`：systemd 正式佈署完整走過一次，見附錄 F.7。
+
+**未實測的項目（環境限制，非腳本問題）：**
+
+- ⚠️ `rolling-restart.sh --hosts`：需要多台主機與 SSH，驗證環境為單機。
+- ⚠️ TLS / SASL / ACL：設定範例來自官方文件，未架設 CA 實測。
+
+---
+
+## 附錄 F：VM 佈署實戰：從裸機到通過驗證
+
+第 9–13 章分別講了準備、安裝、設定與調校。這個附錄把它們串成
+**一台 VM 從開機到通過驗證的完整 runbook**，並提供一鍵腳本。
+容器練習環境（第 3 章）適合學習；到了正式環境，多數團隊的第一站仍是 VM——
+這一章就是為那一步寫的。
+
+### F.1 VM 和容器佈署差在哪裡
+
+| 面向 | 容器（docker-compose） | VM（本章） |
+|---|---|---|
+| 行程管理 | container runtime | **systemd**（graceful shutdown、自動重啟、資源限制） |
+| 資料 | volume（掛錯就丟資料） | 直接落在 VM 磁碟，生命週期與機器一致 |
+| OS 調校 | 受宿主機核心限制 | sysctl / limits / IO scheduler 全部可控 |
+| 適合 | 學習、CI、本機演練 | 正式環境、效能基準、長期營運 |
+
+VM 佈署要額外注意三件容器裡感受不到的事：
+
+1. **Kafka 的讀取效能極度依賴 OS page cache**——heap 只給 JVM 需要的量（一般 4–6 GB 就夠），
+   其餘記憶體留給 page cache，不要把 heap 開好開滿。
+2. **磁碟要獨立**：資料目錄放獨立的資料碟（見 9.3 節），不要和 OS 碟搶 IO。
+3. **虛擬化層的干擾**：關閉 memory ballooning、注意 CPU steal time（`%st` 持續 > 5% 就該換宿主機）、
+   確認虛擬磁碟有啟用 write-back cache 政策與 flush 保證（`acks=all` 的持久性建立在 fsync 有效之上）。
+
+### F.2 兩條路：一鍵腳本或手動 runbook
+
+| 方式 | 適合 | 指令 |
+|---|---|---|
+| 一鍵佈署 | 第一次、標準單機 | `./scripts/install/deploy-vm.sh` |
+| 手動 runbook | 想理解每一步、非標準環境 | 見 F.4 |
+| 多節點 | 三台 VM 組叢集 | 每台跑 `deploy-vm.sh --cluster-id`（見 F.5） |
+
+### F.3 一鍵佈署：deploy-vm.sh
+
+```bash
+# 全預設：裝到 /opt/kafka、服務帳號 kafka、heap 1G、含 OS 調校與驗證
+./scripts/install/deploy-vm.sh
+
+# 正式環境常見的樣子：
+./scripts/install/deploy-vm.sh \
+    --base-dir /data/kafka \
+    --heap "-Xmx6G -Xms6G" \
+    --advertised-host kafka-1.internal
+
+# 9093 被占用（例如同機還跑著 Alertmanager）時：
+./scripts/install/deploy-vm.sh --controller-port 9094
+
+# 先看它會做什麼：
+DRY_RUN=true ./scripts/install/deploy-vm.sh
+```
+
+腳本做七件事，每件都對應手冊的一章：
+
+| 步驟 | 內容 | 對應章節 |
+|---|---|---|
+| 1 | preflight 前置檢查 + port 檢查 | 第 9 章 |
+| 2 | 建立 `kafka` 系統帳號與目錄（broker 不用 root 跑） | 9.4 |
+| 3 | 以服務帳號執行 `install-kafka.sh --no-start`（下載、SHA512、格式化） | 第 10 章 |
+| 4 | sysctl + limits OS 調校（`--skip-tuning` 可跳過） | 第 13 章 |
+| 5 | 渲染並安裝 systemd unit | 13 章 + 範本 |
+| 6 | `systemctl enable --now kafka`，等待就緒 | — |
+| 7 | `health-check.sh` + `smoke-test.sh` 驗證 | 附錄 B |
+
+### F.4 手動 runbook（理解每一步）
+
+```bash
+# 0. 前置檢查
+./scripts/install/preflight.sh
+
+# 1. 服務帳號與目錄
+sudo useradd --system --no-create-home --shell /usr/sbin/nologin kafka
+sudo mkdir -p /opt/kafka && sudo chown -R kafka:kafka /opt/kafka
+
+# 2. 以 kafka 身分安裝（--no-start：啟動交給 systemd）
+sudo -u kafka env HOME=/opt/kafka KAFKA_BASE_DIR=/opt/kafka \
+    bash scripts/install/install-kafka.sh --no-start
+
+# 3. OS 調校
+sudo cp conf/templates/sysctl-kafka.conf /etc/sysctl.d/99-kafka.conf
+sudo sysctl --system
+sudo cp conf/templates/limits-kafka.conf /etc/security/limits.d/99-kafka.conf
+
+# 4. systemd unit（注意：資料目錄一定要在 ReadWritePaths 裡）
+sed -e 's|@@KAFKA_HOME@@|/opt/kafka/current|g' \
+    -e 's|@@KAFKA_CONF@@|/opt/kafka/conf/server.properties|g' \
+    -e 's|@@KAFKA_LOG_DIR@@|/opt/kafka/logs|g' \
+    -e 's|@@KAFKA_DATA_DIR@@|/opt/kafka/data|g' \
+    -e 's|@@KAFKA_USER@@|kafka|g' \
+    -e 's|@@HEAP@@|-Xmx6G -Xms6G|g' \
+    conf/templates/kafka.service.tmpl | sudo tee /etc/systemd/system/kafka.service
+sudo systemctl daemon-reload && sudo systemctl enable --now kafka
+
+# 5. 驗證
+BOOTSTRAP_SERVERS=localhost:9092 KAFKA_BASE_DIR=/opt/kafka ./scripts/ops/health-check.sh
+BOOTSTRAP_SERVERS=localhost:9092 KAFKA_BASE_DIR=/opt/kafka ./scripts/test/smoke-test.sh
+```
+
+### F.5 三台 VM 組叢集
+
+第一台照 F.3/F.4 跑，記下輸出的 `cluster.id`，其餘每台：
+
+```bash
+./scripts/install/deploy-vm.sh \
+    --cluster-id <第一台的 cluster.id> \
+    --advertised-host kafka-N.internal
+```
+
+再依 11 章調整 `--voters` 與 cluster mode 的細節。上線前跑一次
+`./scripts/test/run-all-tests.sh --with-failure-injection`。
+
+### F.6 VM 最佳化清單（第 13 章的 VM 特化版）
+
+**記憶體**
+- heap 4–6 GB 固定（`-Xms` = `-Xmx`，避免動態擴縮的停頓），其餘全部留給 page cache
+- `vm.swappiness=1`；hypervisor 端關閉 memory ballooning 與 KSM
+- 透明大頁（THP）維持 `madvise` 或關閉，避免 compaction 停頓
+
+**磁碟**
+- 資料目錄放獨立虛擬磁碟；檔案系統 ext4 或 XFS，掛載加 `noatime`
+- IO scheduler 用 `none`（NVMe）或 `mq-deadline`（虛擬磁碟）
+- 確認 hypervisor 對 fsync 的保證——`acks=all` 擋不住會說謊的磁碟
+
+**CPU / 網路**
+- 監控 CPU steal time（`top` 的 `%st`）：持續 > 5% 表示宿主機超賣
+- 跨機房複寫用大 socket buffer（sysctl 範本已含 16 MB 上限）
+- VM 網卡開 multiqueue（virtio-net `queues=N`）
+
+**systemd unit 裡已經做掉的**（見範本註解）
+- `TimeoutStopSec=300` + `SendSIGKILL=no`：graceful shutdown 慢慢來，別 SIGKILL
+- `LimitNOFILE=1048576`：partition 與連線數多時的檔案描述符
+- `OOMScoreAdjust=-500`：記憶體吃緊時先殺別人
+- `Restart=on-failure` + `StartLimitBurst=3`：反覆崩潰時停下來讓人看
+
+### F.7 本次實測記錄
+
+以下是本章 runbook 在真實 VM 上完整跑過一次的記錄（2026-08-27）。
+
+**環境**：WSL2 VM（Hyper-V），Fedora 44，Linux 6.18，4 vCPU / 15 GB RAM，
+ext4，systemd，Temurin JDK 21。同機還跑著三節點 Docker 練習叢集與一套監控，
+是「一台不乾淨的機器」——正好測出真實世界會遇到的問題。
+
+**指令**：
+
+```bash
+./scripts/install/deploy-vm.sh \
+    --controller-port 9094 \                      # 9093 被同機的 Alertmanager 占用
+    --tarball ~/kafka/downloads/kafka_2.13-4.1.2.tgz \
+    --java-home /opt/java-21 \                    # JDK 原本在 ~/.sdkman（見下）
+    --advertised-host localhost
+```
+
+**實際遇到的三個問題**（腳本已把處理方式內建）：
+
+| 問題 | 症狀 | 處理 |
+|---|---|---|
+| 預設 controller port 被占用 | Alertmanager 也用 9093 | 佈署前 port 檢查直接擋下，`--controller-port` 改掉 |
+| 服務帳號讀不到 repo | 家目錄是 700，`sudo -u kafka` 執行安裝直接 Permission denied | 安裝以 root 執行、完成後 `chown` 給服務帳號 |
+| JDK 裝在家目錄（SDKMAN） | `ProtectHome=true` 讓 unit 找不到 java | 偵測後拒絕並給出指引；複製 JDK 到 `/opt` 再以 drop-in 設 `JAVA_HOME` |
+
+**驗證結果**：
+
+| 項目 | 結果 |
+|---|---|
+| preflight | 0 失敗 / 3 警告（記憶體、9093、swappiness——皆屬預期） |
+| 安裝 | tarball 重用、KRaft 格式化（metadata 4.1-IV1）、`--no-start` 正常 |
+| sysctl | `vm.swappiness` 60→1、`net.core.somaxconn` 4096→32768 等生效 |
+| systemd | `User=kafka`、`LimitNOFILE=1048576`、`OOMScoreAdjust=-500`、`TimeoutStopSec=300` 全部生效 |
+| health-check | 可連線，quorum leader 正常（單機 exit 0） |
+| smoke-test | **14/14 通過**（含 acks=all 100 筆無遺失、offset 提交、key 分區、動態設定） |
+| graceful restart | `systemctl restart kafka` 後 **1 秒內恢復服務** |
+
+> 教訓：三個問題沒有一個是 Kafka 本身的問題，全部來自「機器不是為 Kafka 準備的」。
+> 這就是 preflight 與 port 檢查放在第一步的原因——
+> 正式環境請優先給 Kafka 一台乾淨、專用的 VM。
 
 ---
 

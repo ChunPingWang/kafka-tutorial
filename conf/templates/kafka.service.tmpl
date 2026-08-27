@@ -5,6 +5,7 @@
 #   sed -e 's|@@KAFKA_HOME@@|/opt/kafka/current|g' \
 #       -e 's|@@KAFKA_CONF@@|/opt/kafka/conf/server.properties|g' \
 #       -e 's|@@KAFKA_LOG_DIR@@|/var/log/kafka|g' \
+#       -e 's|@@KAFKA_DATA_DIR@@|/data/kafka|g' \
 #       -e 's|@@KAFKA_USER@@|kafka|g' \
 #       -e 's|@@HEAP@@|-Xmx6G -Xms6G|g' \
 #       conf/templates/kafka.service.tmpl | sudo tee /etc/systemd/system/kafka.service
@@ -60,7 +61,9 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=full
 ProtectHome=true
-ReadWritePaths=@@KAFKA_LOG_DIR@@ /var/lib/kafka
+# log 目錄與資料目錄（log.dirs）都必須列在這裡，
+# 缺少任何一個存在的路徑會讓 unit 以 status=226/NAMESPACE 直接啟動失敗
+ReadWritePaths=@@KAFKA_LOG_DIR@@ @@KAFKA_DATA_DIR@@
 
 [Install]
 WantedBy=multi-user.target
