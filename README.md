@@ -1065,6 +1065,10 @@ enable.auto.commit=false         # 改成處理成功後才手動 commit
 
 ### 9.1 執行前置檢查
 
+安裝失敗與上線後的怪病，多數不是 Kafka 的問題，而是機器沒準備好——port 被占、
+ulimit 太低、時間不同步、磁碟掛在 NFS 上。事前一分鐘的檢查，換掉的是事後數小時的排錯
+（附錄 F.7 的實測正是如此：踩到的三個問題全部來自機器，沒有一個來自 Kafka）。
+
 ```bash
 ./scripts/install/preflight.sh                # 學習環境
 STRICT=true ./scripts/install/preflight.sh    # 正式環境（警告也視為失敗）
@@ -1086,6 +1090,9 @@ STRICT=true ./scripts/install/preflight.sh    # 正式環境（警告也視為�
 
 ### 9.3 磁碟規劃
 
+Kafka 的效能上限就是磁碟的循序寫入頻寬，而它最怕兩件事：和別人搶 IO（OS、log、
+其他服務），以及寫放大（RAID 5/6 的 parity）。先把磁碟隔出來，後面的調校才有意義。
+
 ```
 /                    50 GB    系統
 /opt/kafka          20 GB    程式本體（多版本並存用）
@@ -1104,6 +1111,10 @@ STRICT=true ./scripts/install/preflight.sh    # 正式環境（警告也視為�
    在 `log.dirs` 用逗號列出）或 RAID 10。
 
 ### 9.4 建立服務帳號與目錄
+
+用 root 跑 broker，等於任何一個 Kafka 漏洞或設定失誤都直接拿到整台機器的最高權限，
+之後 systemd 的權限收斂（`ProtectHome` 等）也全都做不了。專用低權限帳號是把爆炸半徑
+限制在資料目錄之內的第一道防線——先建帳號，再談安裝。
 
 ```bash
 sudo useradd --system --home-dir /opt/kafka --shell /sbin/nologin kafka
@@ -1167,6 +1178,10 @@ DRY_RUN=true ./scripts/install/install-kafka.sh
 ## 11. 多節點叢集安裝
 
 ### 11.1 規劃
+
+多節點安裝真正會失敗的點只有一個：**三台必須共用同一個 cluster.id 與完全一致的
+voters 清單**。任何一台自己產生了新 ID，就會被叢集拒絕或自成孤島。下面每個步驟的
+順序都是為了守住這件事——尤其「記下第一台的 cluster.id」不是可跳過的細節。
 
 以三節點 combined mode 為例：
 
@@ -1253,6 +1268,10 @@ pattern 比對殺掉本機**所有** `kafka.Kafka` 行程。
 
 ### 11.4 用 Docker Compose
 
+想先在一台機器上「體驗多節點才看得到的行為」（副本、ISR、leader 選舉），
+不必真的開三台 VM——本 repo 的 compose 檔刻意採用正式環境等級的設定
+（RF=3、min.insync.replicas=2、關閉自動建 topic），練到的行為與正式環境一致：
+
 ```bash
 docker compose -f docker/docker-compose.yml up -d
 BOOTSTRAP_SERVERS=localhost:19092 ./scripts/test/smoke-test.sh
@@ -1264,6 +1283,10 @@ open http://localhost:8080         # Kafka UI
 讓你在本機就能練到副本、ISR、leader 選舉。
 
 ### 11.5 用 systemd 管理（正式環境）
+
+`start.sh` 起的行程有三個致命弱點：機器重開後不會自己回來、崩潰了沒人重拉、
+關機時沒人保證 graceful shutdown（leader 交接、log 索引寫完整）。systemd 就是來
+補這三件事的——正式環境不要用 nohup 養 broker。
 
 ```bash
 sed -e 's|@@KAFKA_HOME@@|/opt/kafka/current|g' \
@@ -1297,6 +1320,9 @@ Kafka 關機時要把 leader 交接出去、把 log 索引寫完整，這需要�
 以下是 `conf/templates/server.properties.tmpl` 裡每個參數的意義。
 
 ### 12.1 節點身分
+
+這三個參數在 `kafka-storage format` 時就被寫進資料目錄，**事後改了就起不來**
+（meta.properties 不符）——所以它們是「規劃決定」而不是「調校參數」：
 
 ```properties
 process.roles=broker,controller      # 角色，見第 4 章
@@ -1337,6 +1363,9 @@ KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka-1:9092,EXTERNAL://localhost:19092
 
 ### 12.3 執行緒與 I/O
 
+執行緒數不是越大越好——調整前先看 `NetworkProcessorAvgIdlePercent`（見 16 章），
+idle 還很高就加執行緒只是浪費 context switch。預設值適用於多數 8 核以下的機器：
+
 ```properties
 num.network.threads=8                # 約等於 CPU 核心數
 num.io.threads=16                    # 磁碟數 × 2 起跳
@@ -1350,6 +1379,9 @@ num.recovery.threads.per.data.dir=2  # 啟動時每個資料目錄的復原執�
 低於 0.2 表示 `num.io.threads` 不夠。
 
 ### 12.4 儲存
+
+segment 是 Kafka 刪資料的最小單位：retention 到期是「刪整個 segment 檔」，
+不是逐筆刪。所以 segment 大小直接決定「過期資料實際佔多久磁碟」與復原時的掃描量：
 
 ```properties
 log.dirs=/data/kafka-1,/data/kafka-2   # 多顆磁碟用逗號分隔
@@ -1437,6 +1469,11 @@ kafka-configs.sh --bootstrap-server $BS --entity-type brokers --entity-name 1 --
 
 ## 13. 作業系統調校
 
+Kafka 把持久化與讀取效能全部押在作業系統身上——page cache 做讀取快取、mmap 管理
+index、每個 segment 與連線都吃檔案描述符。而 Linux 的通用預設值（swappiness=60、
+FD 1024、偏小的網路 buffer）是為一般伺服器調的：不改，高負載時會出現 swap 造成的
+延遲爆炸與 `Too many open files` 直接停止服務。這一章的每個值都附理由，照抄之前先讀它。
+
 ### 13.1 核心參數
 
 ```bash
@@ -1518,6 +1555,10 @@ Kafka 的安全性有三層，可以獨立啟用：
 
 ### 14.1 啟用 TLS
 
+沒有 TLS 時，SASL 帳密與訊息內容都是**明文**在網路上跑——同網段任何一台被入侵的
+主機都能直接嗅探到密碼與業務資料。所以順序必須是「先加密、再認證」：
+TLS 不開，SCRAM 密碼等於裸奔。
+
 **產生憑證（測試環境用自簽）：**
 
 ```bash
@@ -1597,6 +1638,10 @@ export KAFKA_CLIENT_CONFIG="${PWD}/conf/security/client.properties"
 
 ### 14.3 啟用 ACL
 
+認證只回答「你是誰」，不限制「你能做什麼」——沒有 ACL 時，任何拿到帳號的應用
+都能讀寫、甚至刪除任何 topic（包括別團隊的金流資料）；一個被入侵的低權限服務
+等於整座叢集淪陷。授權是認證之後必須立刻補上的另一半：
+
 ```properties
 authorizer.class.name=org.apache.kafka.metadata.authorizer.StandardAuthorizer
 super.users=User:admin
@@ -1631,6 +1676,9 @@ kafka-acls.sh --bootstrap-server $BS --list
 > 再改成 `false`。直接設 `false` 上線通常會造成大規模服務中斷。
 
 ### 14.4 Quota：防止單一 client 拖垮叢集
+
+最常見的事故不是惡意攻擊，而是自己人：一個半夜跑的批次任務把頻寬吃光，
+線上服務的延遲全面飆高。Quota 就是給每個 client 的「保險絲」：
 
 ```bash
 # 限制某個使用者的頻寬（bytes/sec）
@@ -1667,6 +1715,10 @@ kafka-configs.sh --bootstrap-server $BS --alter \
 本手冊提供 `scripts/ops/topic-admin.sh` 包裝常用操作，並加上防呆。
 
 ### 15.1 Topic 管理
+
+原生 `kafka-topics.sh` 沒有任何護欄——`--delete` 打錯 topic 名稱就是一次事故。
+本手冊的包裝腳本補上防呆（刪除要求輸入完整名稱、危險操作先 dry-run），
+日常操作建議走包裝、原生指令留給腳本裡沒有的場景：
 
 ```bash
 # 列出所有 topic（含 partition / RF 摘要）
@@ -1776,6 +1828,10 @@ kafka-leader-election.sh --bootstrap-server $BS --election-type PREFERRED --all-
 
 ## 16. 監控：該看哪些指標
 
+Kafka 的故障幾乎都有前兆——ISR 縮減、lag 上升、磁碟逼近滿——但 broker 不會主動
+告訴你。沒有指標時，你的第一個「告警」就是使用者打電話進來，而那時通常已經錯過了
+能便宜處理的時間窗。這一章把「哪些指標值得看、超過多少該行動」一次交代清楚。
+
 ### 16.1 一鍵設定
 
 ```bash
@@ -1825,6 +1881,10 @@ curl -s localhost:7071/metrics | head
   或部署 `kafka-lag-exporter`
 
 ### 16.4 定期健康檢查
+
+指標告警看的是單一數值，健康檢查做的是**綜合判斷**（連線、quorum、副本、磁碟、lag
+一次看完並給出 0/1/2 分級）——兩者互補：告警負責叫醒你，健康檢查負責讓你三十秒內
+掌握全貌。建議排進 cron 並收集退出碼：
 
 ```bash
 ./scripts/ops/health-check.sh                 # 人看的
@@ -1879,6 +1939,29 @@ curl -s localhost:7071/metrics | head
 | ConsumerLagHigh | 依業務 SLA 設定 | warning |
 
 ---
+
+### 16.6 Grafana Dashboard
+
+告警負責「叫人」，但排查問題時你需要的是「看趨勢」——ISR 是這五分鐘才掉的還是
+掉了一整天？流量是漸增還是階梯跳？沒有 dashboard，這些問題只能拿指令一次次查。
+本 repo 附上一份與 16.1 的 jmx_exporter 指標名完全對齊的 dashboard：
+
+```bash
+# conf/monitoring/grafana-kafka-dashboard.json
+# 匯入方式：Grafana UI「Import dashboard」貼上檔案內容，
+# 或用 API：
+curl -s -X POST http://<grafana>/api/dashboards/db \
+  -H 'Content-Type: application/json' -u admin:<密碼> \
+  -d "{\"dashboard\": $(cat conf/monitoring/grafana-kafka-dashboard.json), \"overwrite\": true}"
+```
+
+八個面板：URP、offline/under-min-isr、active controller（總和應恆為 1）、
+訊息流入速率、bytes in/out、produce p99、ISR shrink/expand、JVM heap。
+匯入後在變數列選擇你的 Prometheus datasource 即可。
+
+> 實測註記：面板中每一條 PromQL 都經 Prometheus API 解析驗證，
+> 且指標名逐一與 `:7071/metrics` 的實際輸出核對過——
+> 「寫成想像中的指標名」是 dashboard 永遠一片空白的最常見原因。
 
 ## 17. 滾動重啟與版本升級
 
@@ -2035,6 +2118,10 @@ kafka-configs.sh --bootstrap-server $BS --entity-type brokers --entity-default \
 
 ### 18.3 移除 broker
 
+broker 上還留有 partition 副本時直接關機，等於瞬間製造大量 under-replicated
+partition、把叢集的容錯層直接吃掉一層。所以順序是鐵律：**先把資料搬空、確認歸零、
+才停機註銷**——下面五步的存在理由就是這個順序：
+
 ```bash
 # 1. 產生「不含要移除的 broker」的重分配計畫
 kafka-reassign-partitions.sh --bootstrap-server $BS \
@@ -2076,6 +2163,9 @@ kafka-log-dirs.sh --bootstrap-server $BS --describe | jq .
 ## 19. 故障排除手冊
 
 ### 19.1 診斷起手式
+
+故障當下最大的敵人是慌亂中亂槍打鳥。固定一個檢查順序（叢集整體 → quorum →
+broker log → 系統資源），每次都從同一個地方開始，才能在壓力下不漏掉顯而易見的線索：
 
 ```bash
 # 1. 整體健康
@@ -2285,6 +2375,53 @@ broker 可能無法啟動，或回傳損毀的資料。
 
 ---
 # 第五部：備份與災難備援
+
+### 19.8 換掉一台壞 broker（完整 runbook）
+
+硬碟終究會壞。壞掉當下叢集還活著（這正是 RF=3 的意義），但**你此刻只剩一層容錯**
+——再壞一台就開始停寫。所以換 broker 不是「有空再做」，而是有時限的降級狀態處理。
+依「機器還能不能用同一個身分回來」分成兩條路：
+
+**情境 A：磁碟壞了、機器可修（node.id 不變）——最常見，也最簡單**
+
+Kafka 對這個情境有內建答案：同一個 node.id 帶著空磁碟回來，
+會自動重新加入並從其他副本完整重建資料，**不需要任何 reassignment**。
+
+```bash
+# 1. 確認災情：預期看到大量 URP（這是正常的降級狀態，不是二次故障）
+./scripts/ops/health-check.sh                        # 預期 exit 2
+
+# 2. 修機器/換磁碟，用「同一個 node.id、同一個 cluster.id」重新格式化並啟動
+#    （install-kafka.sh --node-id <原ID> --cluster-id <叢集ID>，或容器直接重建）
+
+# 3. 等副本重建：URP 會隨追平逐步歸零
+watch -n 10 'kafka-topics.sh --bootstrap-server $BS --describe --under-replicated-partitions | wc -l'
+
+# 4. 驗證資料完整、leader 重新平衡
+./scripts/test/smoke-test.sh
+```
+
+**情境 B：機器整台報廢（要用新的 node.id）**
+
+```bash
+# 1. 新機器照第 11 章加入叢集（新 node.id、同 cluster.id）
+# 2. 把死掉 broker 的副本搬到新 broker：產生排除死者、包含新人的重分配計畫
+kafka-reassign-partitions.sh --bootstrap-server $BS \
+  --topics-to-move-json-file all-topics.json \
+  --broker-list "1,2,4" --generate          # 假設 3 壞了、4 是新人
+kafka-reassign-partitions.sh --bootstrap-server $BS \
+  --reassignment-json-file plan.json --execute
+kafka-reassign-partitions.sh --bootstrap-server $BS \
+  --reassignment-json-file plan.json --verify   # 直到全部 completed
+# 3. 註銷死者，metadata 才會乾淨
+kafka-cluster.sh unregister --bootstrap-server $BS --id 3
+```
+
+> **實測記錄（情境 A，三節點 Docker 叢集）**：對 kafka-3 執行「刪容器＋刪資料
+> volume」模擬磁碟全毀 → 124 個 URP → 以同 node.id 空磁碟重建 → **258 秒**副本
+> 全部追平、3000 筆測試資料一筆不少。情境 B 的 reassignment 與 unregister
+> 亦在同叢集實測（2 個 partition 搬移 completed、broker unregister 成功）。
+> 你的重建時間 ≈ 該機資料量 ÷ 網路與磁碟頻寬，請演練一次記下自己的數字。
 
 ## 20. 先想清楚：Kafka 的「備份」是什麼
 
@@ -2781,6 +2918,27 @@ status=failover_completed
 > **先啟 consumer 再啟 producer** 這個順序很重要：
 > 在沒有新流量的情況下先驗證讀取路徑是通的，比兩邊一起開再除錯容易太多。
 
+**把「切換」做成只改一個地方**
+
+上面的指引之所以是「人工清單」，是因為 bootstrap 位址散落在每個應用程式的設定裡
+——切換時要改 N 個地方，而災難當下最缺的就是冷靜和時間。降低 RTO 的正解是
+**把位址收斂到一個間接層**，切換時只改那一層：
+
+| 間接層 | 做法 | 切換動作 |
+|---|---|---|
+| DNS | client 一律連 `kafka.internal`，TTL 壓低（≤60s） | 改一筆 DNS 紀錄 |
+| 設定中心 | bootstrap.servers 來自 Consul/etcd/config service | 改一個 key，應用 reload |
+| 部署系統 | 位址是部署參數 | 改參數重佈（最慢，但最不容易漏） |
+
+兩個配套一定要有：
+
+1. **`bootstrap.servers` 本身就寫多個位址**。它只在「第一次找叢集」時使用，
+   任一位址活著就能拿到完整 metadata——實測把死位址放第一個
+   （`dead-host:9092,localhost:19092`），client 自動跳過、正常連線。
+   這擋得住「單一 bootstrap 主機掛掉」，但擋不住整個叢集掛掉——所以仍需要上面的間接層。
+2. **切換後的驗證自動化**：指引第 4 步的 health-check + smoke-test
+   就是為了讓「切完有沒有通」不靠感覺。
+
 ### 23.5 Failback（切回主叢集）
 
 **這是整個 DR 流程中最容易出錯的一步。切勿直接把流量切回去。**
@@ -2874,6 +3032,28 @@ watch -n 60 './scripts/dr/dr-status.sh --source-alias dc2 \
 - 監控系統只監控主叢集，切過去之後全盲
 - Consumer 的 `auto.offset.reset=latest`，切過去漏掉了積壓的訊息
 - DNS TTL 太長，切換後半小時 client 還連著舊位址
+
+---
+
+### 24.5 讓演練自動發生
+
+「每季演練」寫在 wiki 上的下場，多半是被忙碌的季度無限延期——
+靠人記得的事就會被忘記。把演練交給排程器，缺席的只剩藉口：
+
+```bash
+# 範本：conf/templates/kafka-dr-drill.{service,timer}.tmpl
+# 每季第一個週一 03:00 自動跑 failover --auto --drill，
+# 報告落在 incidents/ 目錄；演練失敗時 unit 變 failed，監控據此告警。
+sed -e 's|@@REPO_DIR@@|/opt/kafka-tutorial|g' -e 's|@@KAFKA_USER@@|kafka|g' \
+    conf/templates/kafka-dr-drill.service.tmpl | sudo tee /etc/systemd/system/kafka-dr-drill.service
+sudo cp conf/templates/kafka-dr-drill.timer.tmpl /etc/systemd/system/kafka-dr-drill.timer
+sudo systemctl daemon-reload && sudo systemctl enable --now kafka-dr-drill.timer
+systemctl list-timers kafka-dr-drill.timer      # 看下次觸發時間
+```
+
+> 驗證註記：兩個 unit 通過 `systemd-analyze verify`；
+> `OnCalendar` 表達式經 `systemd-analyze calendar` 確認（下次觸發＝下季首週一 03:00）。
+> `--drill` 只做檢查、不動任何狀態（見 23 章），放心排程。
 
 ---
 
@@ -3069,6 +3249,47 @@ kafka-console-consumer.sh --bootstrap-server $BS --topic words-output --from-beg
 
 ---
 
+### 28.4 mTLS：憑證即身分
+
+SCRAM 的弱點是「密碼」本身：會被寫進設定檔、貼進聊天室、忘記輪替。
+mTLS 用 client 憑證取代密碼——**沒有可外洩的共享祕密**，身分就是憑證的 DN，
+到期自動失效。代價是要經營憑證的簽發與輪替，適合服務對服務的固定連線。
+
+```bash
+# 用同一顆 CA 簽發 client 憑證（自動產生 keystore 與 client 設定）
+./scripts/security/setup-security.sh client-cert --dir ~/kafka/security --user app-mtls
+
+# broker 端：加一個 ssl.client.auth=required 的 listener
+#   listeners            += MTLS://:9592
+#   protocol map         += MTLS:SSL
+#   listener.name.mtls.ssl.client.auth=required
+# principal 會是 User:CN=app-mtls（可用 ssl.principal.mapping.rules 簡化）
+```
+
+實測（單機 broker）：帶憑證的 client 連線成功；只有 truststore、沒有 client
+憑證的連線在 TLS 握手階段即被拒絕。
+
+### 28.5 靜態加密與資料抹除（合規）
+
+TLS 保護的是「傳輸中」的資料；磁碟上的 segment 檔仍是明文——拔走一顆硬碟
+就能離線讀出所有訊息。Kafka 沒有內建 at-rest 加密，實務解法由下往上選：
+
+1. **磁碟/檔案系統層**（LUKS、雲端 EBS/PD 加密）：對 Kafka 完全透明，先做這個。
+2. **應用層端到端加密**：producer 加密 value、consumer 解密——連 broker 管理員
+   都看不到內容，但犧牲 Streams/Connect 的可讀性與壓縮率，只用於真正敏感的欄位。
+
+**資料抹除（GDPR「被遺忘權」）**：retention 只保證「最終會過期」，
+無法針對特定人。個資場景的正解是 **以使用者 ID 為 key 的 compacted topic +
+tombstone**——送出 `key=user-123, value=null`，compaction 會把該 key 的所有
+歷史值連同 tombstone 一併清除：
+
+```bash
+# 實測（三節點叢集、compacted topic）：寫入 user-123 個資 → 送 tombstone →
+# compaction 後從頭消費：user-123 完全消失、其他 key 完整保留。
+# 抹除延遲由 segment.ms / min.cleanable.dirty.ratio / delete.retention.ms 控制，
+# 合規上請以「最遲 X 天內清除」的組合設定並實測驗證。
+```
+
 ## 29. Kubernetes 佈署與大規模營運
 
 ### 29.1 Strimzi：K8s 上的 Kafka
@@ -3164,6 +3385,10 @@ docker/
 └── docker-compose.cdc.yml       CDC 管線：Postgres + Debezium（第 26 章）
 k8s/strimzi/
 └── kafka-cluster.yaml           Strimzi 單節點練習版 CR（第 29 章）
+conf/monitoring/
+└── grafana-kafka-dashboard.json 與 jmx_exporter 指標對齊的儀表板（16.6）
+conf/templates/
+└── kafka-dr-drill.{service,timer}.tmpl   DR 演練排程 unit（24.5）
 ```
 
 **所有腳本的共通行為：**
@@ -3180,6 +3405,9 @@ k8s/strimzi/
 所有腳本都支援 `--help`。
 
 ## 附錄 B：測試套件
+
+任何變更之後——升級、調參、改腳本——你需要的是客觀證據，不是「應該沒問題」的感覺。
+這套測試就是那個證據：日常用 `--quick`，上線前與變更後跑完整版加故障注入。
 
 ```bash
 # 全部
@@ -3360,6 +3588,13 @@ Linux 6.18，4 vCPU / 15 GB，Temurin JDK 21，Docker 29 / kind v0.32。
 | `docker-compose.dr.yml` | 雙叢集啟動 + MM2 複寫 + dr-status（cluster id 修復後） | ✅ |
 | `docker-compose.cdc.yml` | Debezium connector RUNNING，快照/新增/更新事件實際到達 topic | ✅ |
 | `k8s/strimzi/kafka-cluster.yaml` | kind 叢集實際套用：Kafka CR Ready、KafkaTopic 自動建立、叢集內收發 2/2 | ✅ |
+| `conf/monitoring/grafana-kafka-dashboard.json` | 每條 PromQL 經 Prometheus API 解析、指標名逐一對照 `:7071/metrics`、實際匯入運行中 Grafana 成功 | ✅ |
+| `kafka-dr-drill.{service,timer}.tmpl` | 渲染後過 `systemd-analyze verify`；OnCalendar 經 `systemd-analyze calendar` 確認觸發時間 | ✅ |
+| `setup-security.sh client-cert`（mTLS） | 單機 broker：帶憑證連線成功、無憑證於握手即拒 | ✅ |
+| 19.8 壞 broker runbook | 實際刪除 kafka-3 容器＋volume：124 URP → 同 id 重建 → 258 秒追平、3000 筆無損；情境 B 的 reassign/unregister 亦實測 | ✅ |
+| 23.4 多位址 bootstrap | 死位址排第一（`dead-host:9092,localhost:19092`）仍成功連線 | ✅ |
+| 28.5 GDPR 抹除 | compacted topic + tombstone：目標 key 個資與 tombstone 皆清除、他人保留 | ✅ |
+| §29.2 Quota | 1MB/s 限速下 40MB 收斂至 1.07MB/s，短跑由 burst 窗口吸收 | ✅ |
 
 ### E.2 未實測項目（原因）
 
@@ -3546,6 +3781,33 @@ ext4，systemd，Temurin JDK 21。同機還跑著三節點 Docker 練習叢集�
 > 正式環境請優先給 Kafka 一台乾淨、專用的 VM。
 
 ---
+
+### F.8 三台以上的機隊：把 deploy-vm.sh 交給編排工具
+
+單機一鍵之後，下一個問題是「十台怎麼辦」。答案不是把腳本改成迴圈，
+而是交給你既有的編排工具（Ansible/Salt/Terraform provisioner）——
+**每台跑一次 `deploy-vm.sh`，共用同一個 cluster.id**，腳本本身已經冪等
+（帳號存在就跳過、tarball 存在就不下載、已格式化就不重複格式化）。
+
+Ansible 的骨架長這樣（示意；本環境無多機可實測，未附成品 playbook）：
+
+```yaml
+- hosts: kafka_brokers
+  serial: 1                    # 一次一台，與滾動重啟同一精神
+  tasks:
+    - name: deploy kafka
+      command: >
+        /opt/kafka-tutorial/scripts/install/deploy-vm.sh
+        --cluster-id {{ kafka_cluster_id }}
+        --advertised-host {{ inventory_hostname }}
+        --heap "-Xmx6G -Xms6G" --skip-verify
+    - name: verify node
+      command: /opt/kafka-tutorial/scripts/ops/health-check.sh
+      environment: { BOOTSTRAP_SERVERS: "{{ inventory_hostname }}:9092" }
+```
+
+要點只有三個：`serial: 1`（別同時動多台）、cluster.id 當變數統一下發、
+每台裝完立刻 health-check 再進下一台——這三件事把第 17 章的滾動精神帶進佈署。
 
 ## 授權與貢獻
 

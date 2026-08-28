@@ -21,6 +21,15 @@
 #   acl-app --user NAME --topic PREFIX [--group PREFIX]
 #       給應用程式帳號最小權限：指定前綴 topic 的讀寫 + 指定前綴 group 的讀取。
 #
+#   client-cert --dir DIR --user NAME
+#       mTLS 用的 client 憑證：用同一顆 CA 簽發、產生 keystore 與
+#       DIR/client-mtls-NAME.properties。搭配 broker 端 mTLS listener：
+#         listeners 加上          MTLS://:9592
+#         protocol map 加上       MTLS:SSL
+#         listener.name.mtls.ssl.client.auth=required
+#       憑證的 DN（CN=NAME）就是 principal（User:CN=NAME），可用
+#       ssl.principal.mapping.rules 簡化成 User:NAME。
+#
 # 典型流程（詳見 README 28 章，含單機實測記錄）：
 #   1. ./setup-security.sh pki --dir ~/kafka/security --cn kafka-1.internal
 #   2. ./setup-security.sh render --dir ~/kafka/security
@@ -186,6 +195,42 @@ acl-app)
       --operation Read --group "${GROUP_PREFIX}" --resource-pattern-type prefixed
   fi
   log_ok "已授權 User:${USER_NAME} 讀寫 topic 前綴「${TOPIC_PREFIX}」$( [[ -n "${GROUP_PREFIX}" ]] && echo "、消費 group 前綴「${GROUP_PREFIX}」" )"
+  ;;
+
+# -----------------------------------------------------------------------------
+client-cert)
+  [[ -n "${DIR}" && -f "${DIR}/passwords.env" ]] || die "client-cert 需要 --dir（先跑 pki）"
+  [[ -n "${USER_NAME}" ]] || die "client-cert 需要 --user"
+  # shellcheck disable=SC1090
+  source "${DIR}/passwords.env"
+  KS="${DIR}/${USER_NAME}.keystore.p12"
+  keytool -genkeypair -alias "${USER_NAME}" -keyalg RSA -keysize 2048 -validity "${DAYS}" \
+    -dname "CN=${USER_NAME}" \
+    -keystore "${KS}" -storetype PKCS12 -storepass "${KS_PW}" >/dev/null 2>&1
+  keytool -certreq -alias "${USER_NAME}" -keystore "${KS}" -storepass "${KS_PW}" \
+    -file "${DIR}/${USER_NAME}.csr" >/dev/null 2>&1
+  keytool -gencert -alias ca -keystore "${DIR}/ca.p12" -storepass "${CA_PW}" \
+    -infile "${DIR}/${USER_NAME}.csr" -outfile "${DIR}/${USER_NAME}.crt" \
+    -validity "${DAYS}" -rfc >/dev/null 2>&1
+  keytool -importcert -alias ca -noprompt -keystore "${KS}" -storepass "${KS_PW}" \
+    -file "${DIR}/ca.crt" >/dev/null 2>&1
+  keytool -importcert -alias "${USER_NAME}" -noprompt -keystore "${KS}" -storepass "${KS_PW}" \
+    -file "${DIR}/${USER_NAME}.crt" >/dev/null 2>&1
+  rm -f "${DIR}/${USER_NAME}.csr"
+  chmod 600 "${KS}"
+
+  cat > "${DIR}/client-mtls-${USER_NAME}.properties" <<EOF
+# ===== mTLS client 設定（憑證即身分，沒有密碼可外洩）=====
+security.protocol=SSL
+ssl.keystore.location=${KS}
+ssl.keystore.type=PKCS12
+ssl.keystore.password=${KS_PW}
+ssl.truststore.location=${DIR}/client.truststore.p12
+ssl.truststore.type=PKCS12
+ssl.truststore.password=${TS_PW}
+EOF
+  chmod 600 "${DIR}/client-mtls-${USER_NAME}.properties"
+  log_ok "mTLS 憑證與設定：${DIR}/client-mtls-${USER_NAME}.properties（principal=User:CN=${USER_NAME}）"
   ;;
 
 -h|--help|help) usage ;;

@@ -16,6 +16,10 @@ Description=Apache Kafka Broker (KRaft)
 Documentation=https://kafka.apache.org/documentation/
 After=network-online.target
 Wants=network-online.target
+# 短時間內反覆失敗就別再自動重啟，讓人介入看問題。
+# 注意：這兩個鍵屬於 [Unit]；放在 [Service] 會被 systemd 靜默忽略（保護失效）
+StartLimitBurst=3
+StartLimitIntervalSec=600
 
 [Service]
 Type=simple
@@ -41,9 +45,6 @@ SendSIGKILL=no
 # --- 重啟策略 ---
 Restart=on-failure
 RestartSec=15
-# 短時間內反覆失敗就別再自動重啟了，讓人介入看問題
-StartLimitBurst=3
-StartLimitIntervalSec=600
 
 # --- 資源限制 ---
 # Kafka 每個 partition 至少 2 個檔案描述符，加上每條連線 1 個，很容易破萬

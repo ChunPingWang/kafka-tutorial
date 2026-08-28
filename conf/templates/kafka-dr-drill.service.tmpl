@@ -1,0 +1,29 @@
+# =============================================================================
+# DR 演練排程（service + 搭配的 .timer）—— README 24.4
+#
+# 為什麼要排程化：沒演練過的 DR 計畫不算 DR 計畫，而「靠人記得」的演練
+# 會在忙碌的季度被無限延期。讓 systemd timer 每季自動跑 --drill，
+# 演練報告落在 incidents/ 目錄，缺席的是人為藉口而不是證據。
+#
+# 安裝：
+#   sed -e 's|@@REPO_DIR@@|/opt/kafka-tutorial|g' \
+#       -e 's|@@KAFKA_USER@@|kafka|g' \
+#       conf/templates/kafka-dr-drill.service.tmpl | sudo tee /etc/systemd/system/kafka-dr-drill.service
+#   sed 的同法安裝 kafka-dr-drill.timer.tmpl 之後：
+#   sudo systemctl daemon-reload && sudo systemctl enable --now kafka-dr-drill.timer
+#   systemctl list-timers kafka-dr-drill.timer     # 確認下次觸發時間
+# =============================================================================
+[Unit]
+Description=Kafka DR drill (failover --drill, quarterly)
+Documentation=file://@@REPO_DIR@@/README.md
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=@@KAFKA_USER@@
+WorkingDirectory=@@REPO_DIR@@
+# --drill 只做檢查、不停止複寫、不改任何狀態；事件目錄留下完整報告
+ExecStart=@@REPO_DIR@@/scripts/dr/failover.sh --auto --drill
+# 演練失敗（備援不可靠）時讓 unit 顯示 failed，監控據此告警
+SuccessExitStatus=0

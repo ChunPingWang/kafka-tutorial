@@ -248,8 +248,10 @@ groups:
           summary: "{{ $labels.instance }} 的 log 寫入速率持續超過 50MB/s"
           description: "確認是否為預期流量；持續高寫入請對照磁碟剩餘空間。"
 
+      # 指標名以 exporter 實際輸出為準（jvm_gc_collection_seconds 是內建 JVM 指標，
+      # 單位已是秒）；寫成想像中的名字告警永遠不會響
       - alert: KafkaJvmGcPauseHigh
-        expr: rate(jvm_gc_collectiontime[5m]) / 1000 > 0.1
+        expr: sum by (instance) (rate(jvm_gc_collection_seconds_sum[5m])) > 0.1
         for: 10m
         labels: {severity: warning}
         annotations:

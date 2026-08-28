@@ -1,0 +1,12 @@
+# 搭配 kafka-dr-drill.service 的排程（安裝方式見 service 範本檔頭）
+[Unit]
+Description=Quarterly Kafka DR drill
+
+[Timer]
+# 每季第一個週一 03:00；改頻率只動這一行
+OnCalendar=Mon *-01,04,07,10-01..07 03:00:00
+Persistent=true
+RandomizedDelaySec=1800
+
+[Install]
+WantedBy=timers.target
