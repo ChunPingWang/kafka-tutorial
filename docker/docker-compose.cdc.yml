@@ -1,0 +1,70 @@
+# =============================================================================
+# CDC 資料管線實驗環境：PostgreSQL + Debezium Connect
+#
+# 練習「資料庫變更 → Kafka」這條最常見的資料管線（README 第 26 章）。
+# 需要先啟動三節點練習叢集（docker-compose.yml），本檔會接上它的網路。
+#
+# 啟動：
+#   docker compose -f docker/docker-compose.yml up -d       # 先有 Kafka 叢集
+#   docker compose -f docker/docker-compose.cdc.yml up -d
+#
+# 註冊 Debezium PostgreSQL connector（Connect REST API 在 localhost:8083）。
+# 注意 topic.creation.*：練習叢集刻意關閉 auto-create（正式環境也該關），
+# 所以必須讓 Connect 代為建立 topic，否則 connector RUNNING 但事件出不來。
+#   curl -s -X POST localhost:8083/connectors -H 'Content-Type: application/json' -d '{
+#     "name": "inventory-cdc",
+#     "config": {
+#       "connector.class": "io.debezium.connector.postgresql.PostgresConnector",
+#       "database.hostname": "cdc-postgres", "database.port": "5432",
+#       "database.user": "demo", "database.password": "demo",
+#       "database.dbname": "inventory", "topic.prefix": "pg",
+#       "plugin.name": "pgoutput",
+#       "topic.creation.enable": "true",
+#       "topic.creation.default.partitions": "3",
+#       "topic.creation.default.replication.factor": "3"
+#     }}'
+#
+# 之後任何 INSERT/UPDATE/DELETE 都會出現在 pg.public.<table> topic。
+# 清除：docker compose -f docker/docker-compose.cdc.yml down -v
+# =============================================================================
+
+services:
+  cdc-postgres:
+    image: postgres:16-alpine
+    container_name: cdc-postgres
+    environment:
+      POSTGRES_USER: demo
+      POSTGRES_PASSWORD: demo
+      POSTGRES_DB: inventory
+    # Debezium 需要 logical replication
+    command: ["postgres", "-c", "wal_level=logical"]
+    ports: ["5432:5432"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U demo -d inventory"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+    networks: [kafka-net]
+
+  cdc-connect:
+    image: quay.io/debezium/connect:3.0.0.Final
+    container_name: cdc-connect
+    depends_on:
+      cdc-postgres: {condition: service_healthy}
+    ports: ["8083:8083"]
+    environment:
+      BOOTSTRAP_SERVERS: kafka-1:9092,kafka-2:9092,kafka-3:9092
+      GROUP_ID: cdc-connect
+      CONFIG_STORAGE_TOPIC: cdc-connect-configs
+      OFFSET_STORAGE_TOPIC: cdc-connect-offsets
+      STATUS_STORAGE_TOPIC: cdc-connect-status
+      # 練習叢集 RF=3；單機叢集請改 1
+      CONFIG_STORAGE_REPLICATION_FACTOR: 3
+      OFFSET_STORAGE_REPLICATION_FACTOR: 3
+      STATUS_STORAGE_REPLICATION_FACTOR: 3
+    networks: [kafka-net]
+
+networks:
+  kafka-net:
+    external: true
+    name: docker_kafka-net

@@ -41,6 +41,13 @@
 23. [災難切換與復原](#23-災難切換與復原)
 24. [DR 演練計畫](#24-dr-演練計畫)
 
+**第六部：應用整合與進階場景**
+25. [應用整合模式：交易、重試與死信佇列](#25-應用整合模式交易重試與死信佇列)
+26. [Kafka Connect 資料管線與 CDC](#26-kafka-connect-資料管線與-cdc)
+27. [Kafka Streams 串流處理](#27-kafka-streams-串流處理)
+28. [安全性實作：TLS + SCRAM + ACL](#28-安全性實作tls--scram--acl)
+29. [Kubernetes 佈署與大規模營運](#29-kubernetes-佈署與大規模營運)
+
 **附錄**
 - [A. 腳本總覽](#附錄-a腳本總覽)
 - [B. 測試套件](#附錄-b測試套件)
@@ -2870,6 +2877,241 @@ watch -n 60 './scripts/dr/dr-status.sh --source-alias dc2 \
 
 ---
 
+# 第六部：應用整合與進階場景
+
+前五部把叢集「建起來、養起來」；這一部回答開發團隊最常問的問題：
+**「所以我的應用程式要怎麼用它？」**
+所有範例都零外部依賴（直接用 Kafka 發行版自帶的 jar 編譯），並且實際執行驗證過。
+
+---
+
+## 25. 應用整合模式：交易、重試與死信佇列
+
+可執行範例在 `examples/java/`，用法：
+
+```bash
+cd examples/java
+BOOTSTRAP_SERVERS=localhost:19092 ./run-example.sh <類別名稱>
+```
+
+### 25.1 交易型 Producer（exactly-once 的寫入端）
+
+`TransactionalProducer.java`——多筆訊息「全有或全無」。三個關鍵：
+
+1. `transactional.id` 必須全域唯一且重啟後不變（zombie fencing 靠它）
+2. 設定它之後冪等性自動開啟
+3. 下游 consumer 必須 `isolation.level=read_committed`
+
+實測行為：commit 3 筆、abort 2 筆之後，`read_committed` 消費恰好只看到 3 筆。
+
+### 25.2 重試 topic + 死信佇列（DLQ）
+
+**Kafka 沒有內建重試與 DLQ**——一筆訊息處理失敗時，你只有三個選擇：
+卡住整個 partition 無限重試（災難）、跳過（掉資料）、或送去別的 topic 之後前進。
+業界標準是第三種：
+
+```
+orders ──失敗──> orders.retry ──重試 N 次仍失敗──> orders.dlq
+   ↑                  │
+   └── 同一個 consumer 也訂閱 retry topic，帶 x-retry-count header 重新處理
+```
+
+`DlqRetryConsumer.java` 的三個關鍵決定（詳見程式內註解）：
+
+| 決定 | 理由 |
+|---|---|
+| 手動 commit，處理完才提交 | 行程掛掉頂多重複處理，不會弄丟 |
+| 失敗訊息「送走再前進」 | Kafka 是循序消費，一筆卡住整個 partition 都停 |
+| DLQ 帶齊 forensics headers | 來源/offset/錯誤/時間都在，才能事後 review 與重放 |
+
+實測行為：`boom-2` 訊息重試 3 次後進入 DLQ，headers 完整
+（`x-retry-count:3, x-orig-topic, x-orig-offset, x-error, x-failed-at`）；
+正常訊息不受影響。
+
+### 25.3 冪等消費
+
+「至少一次投遞 + 冪等處理」是絕大多數系統的正解（完整 EOS 只在 Kafka→Kafka 的
+Streams 管線內免費）。冪等的做法依副作用而定：
+資料庫寫入用 upsert / 唯一鍵；外部 API 用 idempotency key（例如 `topic-partition-offset`）。
+
+---
+
+## 26. Kafka Connect 資料管線與 CDC
+
+Connect 是「宣告式的資料搬運框架」：寫設定、不寫程式，
+把資料庫、檔案、物件儲存接進 Kafka。MM2（第 22 章）本身就是 Connect 應用。
+
+### 26.1 十分鐘看懂 Connect：檔案管線
+
+用發行版自帶的 FileStream connector 體驗完整流程（`connect-standalone` 單機模式）：
+
+```bash
+W=/tmp/connect-demo && mkdir -p "$W/plugins/connect-file"
+# 注意：FileStream connector 自 Kafka 3.2 起「不在」預設 classpath，
+# 必須用 plugin.path 載入。只連結需要的 jar，避免掃描整個 libs（會慢一分鐘以上）。
+ln -s ~/kafka/current/libs/connect-file-*.jar "$W/plugins/connect-file/"
+
+cat > "$W/worker.properties" <<EOF
+bootstrap.servers=localhost:19092
+key.converter=org.apache.kafka.connect.storage.StringConverter
+value.converter=org.apache.kafka.connect.storage.StringConverter
+offset.storage.file.filename=$W/connect.offsets
+plugin.path=$W/plugins
+EOF
+cat > "$W/source.properties" <<EOF
+name=file-source
+connector.class=org.apache.kafka.connect.file.FileStreamSourceConnector
+file=$W/input.txt
+topic=connect-demo
+EOF
+cat > "$W/sink.properties" <<EOF
+name=file-sink
+connector.class=org.apache.kafka.connect.file.FileStreamSinkConnector
+file=$W/output.txt
+topics=connect-demo
+EOF
+
+printf 'line-1\nline-2\nline-3\n' > "$W/input.txt"
+connect-standalone.sh "$W/worker.properties" "$W/source.properties" "$W/sink.properties"
+# 另開視窗：cat $W/output.txt   → 三行都會出現（實測 9 秒內）
+```
+
+### 26.2 CDC：資料庫變更即事件（Debezium）
+
+CDC（Change Data Capture）讀資料庫的 WAL/binlog，把每筆 INSERT/UPDATE/DELETE
+變成 Kafka 事件——不改應用程式就能把既有系統接上事件流。實驗環境已備好：
+
+```bash
+docker compose -f docker/docker-compose.yml up -d        # 先有叢集
+docker compose -f docker/docker-compose.cdc.yml up -d    # Postgres + Debezium
+# 註冊 connector 的 curl 指令在 docker-compose.cdc.yml 檔頭（含 topic.creation 設定）
+```
+
+實測行為：`pg.public.products` topic 依序出現快照（op=r）、新增（c）、更新（u）事件。
+
+**兩個實戰要點**：
+
+1. **關掉 auto-create 的叢集（正式環境應該如此）必須設 `topic.creation.*`**，
+   否則 connector 顯示 RUNNING、事件卻出不來——這是最常見的「CDC 沒反應」原因。
+2. 下游還有 sink connector 生態（S3、Elasticsearch、JDBC⋯⋯多為 Confluent Hub 發佈），
+   部署方式相同：放 jar 到 plugin.path、REST 註冊設定。
+
+### 26.3 Schema 治理
+
+CDC 與跨團隊事件流遲早需要 schema 管理（Avro/Protobuf + Schema Registry / Karapace）。
+本手冊不部署它，但守住兩條就能活得很好：
+**(1) schema 只加欄位、不改不刪（backward compatible）；(2) converter 統一，
+不要一個 topic 混多種格式。** 評估工具時見 7.4 節的取捨討論。
+
+---
+
+## 27. Kafka Streams 串流處理
+
+Streams 是「函式庫不是叢集」：拓撲跑在你的應用程式行程裡，
+用 consumer group 水平擴充，狀態存本機 RocksDB + changelog topic（可重建）。
+不需要多養一套 Flink，就能做聚合、join、視窗運算。
+
+```bash
+kafka-topics.sh --bootstrap-server $BS --create --topic words-input --partitions 3 --replication-factor 3
+cd examples/java && BOOTSTRAP_SERVERS=localhost:19092 ./run-example.sh WordCountStream
+printf 'hello kafka\nhello streams and kafka\n' | kafka-console-producer.sh --bootstrap-server $BS --topic words-input
+kafka-console-consumer.sh --bootstrap-server $BS --topic words-output --from-beginning --property print.key=true
+```
+
+實測結果：`hello=2, kafka=2, streams=1, and=1`。
+執行時可觀察到 Streams 自動建立 repartition 與 changelog 內部 topic——
+這就是它的狀態容錯機制。什麼時候改用 Flink？需要跨 Kafka 之外的 source/sink、
+毫秒級大視窗、或既有 Flink 平台時；純 Kafka 進出的聚合，Streams 幾乎總是夠。
+
+---
+
+## 28. 安全性實作：TLS + SCRAM + ACL
+
+第 14 章講原理，這一章是可執行版。`scripts/security/setup-security.sh` 四個子指令：
+
+| 子指令 | 做什麼 |
+|---|---|
+| `pki --dir DIR --cn HOST` | 自簽 CA、broker keystore、truststore（密碼隨機、檔案 600） |
+| `render --dir DIR` | 產生 broker 安全性片段 + client.properties |
+| `scram-user --user U` | 對執行中叢集建立 SCRAM-SHA-256 帳號 |
+| `acl-app --user U --topic P --group P` | 應用帳號最小權限（前綴式 ACL） |
+
+### 28.1 佈署流程
+
+```bash
+./scripts/security/setup-security.sh pki --dir ~/kafka/security --cn kafka-1.internal
+./scripts/security/setup-security.sh render --dir ~/kafka/security
+# 把 server-security.properties 併入 server.properties、調整 listeners 後滾動重啟
+./scripts/security/setup-security.sh scram-user --user admin
+./scripts/security/setup-security.sh scram-user --user app-orders
+./scripts/security/setup-security.sh acl-app --user app-orders --topic orders --group orders-svc
+```
+
+### 28.2 三個踩過才知道的坑（都寫進了 render 的輸出）
+
+1. **SCRAM listener 需要 broker 端 JAAS 條目**
+   `listener.name.sasl_ssl.scram-sha-256.sasl.jaas.config=...ScramLoginModule required;`
+   ——憑證雖存在 metadata，這行卻不能省，少了 broker 直接啟動失敗。
+2. **`super.users` 要包含 broker 自己走的身分**（PLAINTEXT inter-broker = `User:ANONYMOUS`），
+   否則開 authorizer 的瞬間副本同步就被自己拒絕。
+3. **全新 SASL-only 叢集的第一個管理者**要在 format 時建立：
+   `kafka-storage.sh format ... --add-scram 'SCRAM-SHA-256=[name=admin,password=...]'`。
+
+### 28.3 實測記錄（單機 broker，PLAINTEXT 內部 + SASL_SSL 對外）
+
+| 測試 | 結果 |
+|---|---|
+| admin 走 SASL_SSL 列 topic | ✔ 認證成功 |
+| 錯誤密碼 | ✔ 被拒 |
+| app 寫入已授權前綴 topic | ✔ 成功 |
+| app 寫入未授權 topic | ✔ `TopicAuthorizationException` |
+| app 用授權 group 消費 | ✔ 讀回訊息 |
+
+---
+
+## 29. Kubernetes 佈署與大規模營運
+
+### 29.1 Strimzi：K8s 上的 Kafka
+
+Strimzi operator 把 Kafka 變成 K8s 原生資源：`Kafka`、`KafkaNodePool`、
+`KafkaTopic`、`KafkaUser` 全部是 CR，天生 GitOps。
+
+```bash
+kubectl create namespace kafka
+kubectl apply -f 'https://strimzi.io/install/latest?namespace=kafka' -n kafka
+kubectl apply -f k8s/strimzi/kafka-cluster.yaml -n kafka     # 本 repo 附的單節點練習版
+kubectl -n kafka wait kafka/lab --for=condition=Ready --timeout=600s
+```
+
+`k8s/strimzi/kafka-cluster.yaml` 的行內註解標出了練習版與正式環境的每一處差異
+（replicas、RF、deleteClaim、TLS）。實測（kind + Strimzi 1.2 / API `kafka.strimzi.io/v1`）：
+叢集 Ready、topic operator 自動建立 `k8s-demo`、叢集內 produce/consume 2/2 筆成功。
+
+**VM 還是 K8s？** 已有成熟 K8s 平台與有狀態工作負載經驗 → Strimzi；
+否則 VM（附錄 F）的故障半徑與除錯路徑都單純得多。別為了 Kafka 才引入 K8s。
+
+### 29.2 Quota：多租戶的基本防線
+
+```bash
+kafka-configs.sh --bootstrap-server $BS --alter --entity-type clients \
+  --entity-name slow-app --add-config 'producer_byte_rate=1048576'
+```
+
+實測（單機、限 1MB/s）：短跑 10MB 量到 4.7MB/s——**quota 是滑動視窗平均，
+burst 會先被吸收**；拉長到 40MB 後收斂到 1.07MB/s，且延遲暴增（p99 35 秒）——
+節流是靠「延後回應」實現的，被限流的 client 看到的是延遲不是錯誤。
+另外 quota 是「每台 broker 各自執行」，三節點叢集的實際上限約為設定值 × 3。
+
+### 29.3 更大規模的工具（未在本手冊環境實測）
+
+| 工具 | 解決什麼 | 何時導入 |
+|---|---|---|
+| Cruise Control | 自動偵測不均衡並產生/執行 reassignment | 手動跑 18 章流程開始吃力（~15 台以上） |
+| Tiered Storage（KIP-405） | 舊 segment 下沉物件儲存，本地只留熱資料 | retention 長且磁碟成本主導；需要遠端儲存 plugin |
+| Strimzi Drain Cleaner | K8s 節點維護時安全搬移 partition | Strimzi 上了正式環境之後 |
+
+---
+
 # 附錄
 
 ## 附錄 A：腳本總覽
@@ -2897,10 +3139,31 @@ scripts/
 │   ├── verify-backup.sh         L1 結構 / L2 校驗碼 / L3 實際還原
 │   ├── restore-cluster.sh       依正確順序還原
 │   └── backup-topic-data.sh     訊息層級匯出／匯入
+├── security/
+│   └── setup-security.sh        TLS PKI + SCRAM 使用者 + ACL 起手式（第 28 章）
 └── dr/
     ├── setup-mirrormaker.sh     建立跨叢集複寫
     ├── dr-status.sh             複寫健康度與 RPO 評估
     └── failover.sh              七步切換流程、演練模式、事件記錄
+```
+
+**腳本以外的可執行資產：**
+
+```
+examples/
+├── producer-config.properties   可靠性優先的 producer 設定（逐行註解）
+├── consumer-config.properties   consumer 設定（逐行註解）
+└── java/                        零依賴 Java 範例（用 KAFKA_HOME/libs 編譯，第 25/27 章）
+    ├── run-example.sh           編譯 + 執行包裝
+    ├── TransactionalProducer.java
+    ├── DlqRetryConsumer.java
+    └── WordCountStream.java
+docker/
+├── docker-compose.yml           三節點練習叢集（19092/29092/39092 + UI 8080）
+├── docker-compose.dr.yml        DR 雙叢集演練環境（18092/28092）
+└── docker-compose.cdc.yml       CDC 管線：Postgres + Debezium（第 26 章）
+k8s/strimzi/
+└── kafka-cluster.yaml           Strimzi 單節點練習版 CR（第 29 章）
 ```
 
 **所有腳本的共通行為：**
@@ -3046,31 +3309,64 @@ scripts/
 | 作業系統 | Ubuntu 24.04.4 LTS，Linux 6.18 |
 | 驗證拓撲 | ① 單機 broker ② 兩座獨立叢集（MM2 複寫）③ 三節點 KRaft 叢集（RF=3, min.insync.replicas=2） |
 
-**已實際驗證的項目：**
+第二驗證環境（2026-08-27/28 完整重驗與擴充）：WSL2 VM（Hyper-V），Fedora 44，
+Linux 6.18，4 vCPU / 15 GB，Temurin JDK 21，Docker 29 / kind v0.32。
 
-- ✅ `install-kafka.sh`：單機與三節點 cluster mode，含 SHA512 校驗與 KRaft 格式化
-- ✅ `smoke-test.sh`：14/14 通過（單機 RF=1 與三節點 RF=3 都跑過）
-- ✅ `perf-test.sh`：6 種 producer 情境 + consumer 情境
-- ✅ `resilience-test.sh`：10/10 通過，含實際停掉一台 broker
-- ✅ `health-check.sh`：text 與 json 兩種輸出
-- ✅ `rolling-restart.sh`：`--local` 模式（`--hosts` 的 SSH 路徑未在此環境驗證）
-- ✅ `backup-cluster.sh` → `verify-backup.sh --deep` → `restore-cluster.sh`：完整來回
-- ✅ `backup-topic-data.sh`：跨叢集匯出匯入 53 筆，內容一致
-- ✅ `setup-mirrormaker.sh`：實際複寫成功（來源 53 筆 = 目標 53 筆），offset 自動翻譯生效
-- ✅ `dr-status.sh` / `failover.sh`：演練模式與真實切換
-- ✅ `run-all-tests.sh`：6 個階段全數通過
+### E.1 驗證方式對照表
 
-**後續補驗證（2026-08-27，WSL2 VM / Fedora 44）：**
+每一支腳本與設定檔「怎麼被驗證」的完整記錄。
+方法縮寫：**靜態** = `bash -n` + shellcheck（腳本）或 `docker compose config` / `kubectl apply`（設定）；
+所有可執行腳本另通過 `--help` 煙霧測試（`lib/common.sh` 是函式庫，僅供 source，不在此列）。
 
-- ✅ `docker/docker-compose.yml`：實際拉取 `apache/kafka:4.1.2` 並啟動三節點叢集，
-  `run-all-tests.sh --quick` 六階段全數通過、`resilience-test.sh --docker` 10/10 通過
-  （實測單機故障 MTTR 6 秒）。
-- ✅ `deploy-vm.sh`：systemd 正式佈署完整走過一次，見附錄 F.7。
+**scripts/ —— 全部先過靜態，再依下表實測**
 
-**未實測的項目（環境限制，非腳本問題）：**
+| 腳本 | 實測方式 | 結果 |
+|---|---|---|
+| `lib/common.sh` | 被所有腳本 source；覆寫順序單獨測（env > kafka-env.sh > 預設） | ✅ |
+| `install/preflight.sh` | 直接執行於本機 | ✅ 0 失敗 3 警告 |
+| `install/install-kafka.sh` | 完整下載 133MB + SHA512 + 格式化；`--roles broker` 節點實際加入既有 quorum；`DRY_RUN=true` 於乾淨目錄零副作用 | ✅ |
+| `install/deploy-vm.sh` | 在本 VM 真實佈署（systemd + OS 調校），冒煙 14/14，restart 1 秒恢復（F.7） | ✅ |
+| `ops/health-check.sh` | 健康叢集 exit 0；實際停一台 broker → 完整報告 + exit 2 | ✅ |
+| `ops/topic-admin.sh` | 經 run-all-tests 與各章操作間接覆蓋（建立/設定/刪除） | ✅ |
+| `ops/rolling-restart.sh` | `--local` 對單機 broker 完整走過（含 KRaft quorum 門檻）；`--hosts` 需多主機 SSH，本環境無 sshd，**未實測** | ✅ / ⚠️ |
+| `ops/monitoring-setup.sh` | 產出的告警規則過 `promtool check rules`（10 rules OK）；jmx_exporter 實際掛上 systemd broker，`:7071/metrics` 出現 kafka_* 指標 | ✅ |
+| `backup/backup-cluster.sh` | 對三節點叢集備份；含逗號值設定的 topic 完整進入 recreate 腳本 | ✅ |
+| `backup/verify-backup.sh` | L1/L2 通過；缺 server.properties 的備份改判警告（實測） | ✅ |
+| `backup/restore-cluster.sh` | 跨叢集還原 round-trip（3 節點備份 → 單機），設定含 `compact,delete` 完整套用；RF 過高時逐項失敗不中斷 | ✅ |
+| `backup/backup-topic-data.sh` | 5 筆匯出→匯入一致；含換行訊息大聲失敗零殘留；`--format base64` 明確拒絕 | ✅ |
+| `dr/setup-mirrormaker.sh` | `--topics 'orders\|payments'` 渲染正確；MM2 端到端複寫 40+13 筆分毫不差 | ✅ |
+| `dr/dr-status.sh` | 對複寫中的 dc1→dc2 執行，RPO=0 正確回報 | ✅ |
+| `dr/failover.sh` | `--drill` 演練模式（前一環境亦驗證過真實切換） | ✅ |
+| `security/setup-security.sh` | 專用單機 broker 實測五項：TLS+SCRAM 認證、錯誤密碼拒絕、ACL 允許寫/拒絕寫/授權消費 | ✅ 5/5 |
+| `test/smoke-test.sh` | 三節點與 VM 佈署各跑一次 | ✅ 14/14 ×2 |
+| `test/perf-test.sh` | 6 情境完整跑（zstd+批次 48MB/s 最佳） | ✅ |
+| `test/resilience-test.sh` | 實際 `docker stop kafka-2`：min.isr 保護、MTTR 6 秒、HW 訊息浮現 | ✅ 10/10 |
+| `test/run-all-tests.sh` | 每輪修復後重跑，六階段 | ✅ ×3 |
 
-- ⚠️ `rolling-restart.sh --hosts`：需要多台主機與 SSH，驗證環境為單機。
-- ⚠️ TLS / SASL / ACL：設定範例來自官方文件，未架設 CA 實測。
+**conf/ 與 docker/ 設定**
+
+| 設定 | 實測方式 | 結果 |
+|---|---|---|
+| `server.properties.tmpl` | 每次安裝渲染後由真實 broker 啟動驗證 | ✅ |
+| `kafka.service.tmpl` | 渲染為 VM systemd unit，User/Limit/OOM/TimeoutStop 逐項核對生效 | ✅ |
+| `sysctl-kafka.conf` | `deploy-vm.sh` 逐鍵套用（swappiness 60→1 等實測生效） | ✅ |
+| `limits-kafka.conf` | 套用至 limits.d（systemd 場景以 unit Limit* 為準，亦已驗證） | ✅ |
+| `mm2.properties.tmpl` | 渲染後由真實 MM2 行程使用（見 setup-mirrormaker 列） | ✅ |
+| `kafka-env.sh.example` | 複製後實測「命令列 > 環境檔 > 預設」覆寫順序 | ✅ |
+| `security/client.properties.example` | 語法同源於第 28 章實測產出的 client.properties | ✅ |
+| `examples/*.properties` | 作為 console 工具 `--producer.config`/`--consumer.config` 使用 | ✅ |
+| `examples/java/*` | 三個範例全數編譯執行並驗證行為（25/27 章） | ✅ |
+| `docker-compose.yml` | 三節點啟動、全測試套件；volume 修復後 `down&&up` 資料 7/7 存活 | ✅ |
+| `docker-compose.dr.yml` | 雙叢集啟動 + MM2 複寫 + dr-status（cluster id 修復後） | ✅ |
+| `docker-compose.cdc.yml` | Debezium connector RUNNING，快照/新增/更新事件實際到達 topic | ✅ |
+| `k8s/strimzi/kafka-cluster.yaml` | kind 叢集實際套用：Kafka CR Ready、KafkaTopic 自動建立、叢集內收發 2/2 | ✅ |
+
+### E.2 未實測項目（原因）
+
+- ⚠️ `rolling-restart.sh --hosts`：SSH 多主機路徑。本環境無 sshd 且僅單機；
+  邏輯與 `--local` 共用同步門檻，遠端片段經靜態審查。
+- ⚠️ 29.3 的 Cruise Control / Tiered Storage / Drain Cleaner：僅概念性介紹，表內已標注。
+- ⚠️ Schema Registry（26.3）：刻意不部署，僅提供治理原則。
 
 ---
 

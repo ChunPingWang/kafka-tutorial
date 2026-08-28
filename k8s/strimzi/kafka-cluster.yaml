@@ -1,0 +1,70 @@
+# =============================================================================
+# Strimzi Kafka 叢集（KRaft 模式）—— README 第 29 章
+#
+# 前置（operator）：
+#   kubectl create namespace kafka
+#   kubectl apply -f 'https://strimzi.io/install/latest?namespace=kafka' -n kafka
+#
+# 套用本檔：
+#   kubectl apply -f k8s/strimzi/kafka-cluster.yaml -n kafka
+#   kubectl -n kafka wait kafka/lab --for=condition=Ready --timeout=300s
+#
+# 本檔是「單節點練習版」（combined mode、RF=1）。
+# 正式環境的差異已在行內註解標出：replicas=3、角色分離、RF=3/min.isr=2。
+# =============================================================================
+apiVersion: kafka.strimzi.io/v1
+kind: KafkaNodePool
+metadata:
+  name: combined
+  labels:
+    strimzi.io/cluster: lab
+spec:
+  replicas: 1              # 正式環境：3（或 controller/broker 兩個 pool 各自調整）
+  roles:
+    - controller
+    - broker               # 正式環境（>10 節點）建議拆成兩個 pool 分離角色
+  storage:
+    type: jbod
+    volumes:
+      - id: 0
+        type: persistent-claim
+        size: 5Gi          # 正式環境：依第 5 章容量規劃計算
+        deleteClaim: true  # 正式環境：false！刪 CR 時保留資料
+---
+apiVersion: kafka.strimzi.io/v1
+kind: Kafka
+metadata:
+  name: lab
+  annotations:
+    strimzi.io/kraft: enabled
+    strimzi.io/node-pools: enabled
+spec:
+  kafka:
+    listeners:
+      - name: plain
+        port: 9092
+        type: internal
+        tls: false         # 正式環境：tls: true + authentication（Strimzi 會代管憑證）
+    config:
+      # 單節點練習值；正式環境對照第 8 章：RF=3、min.insync.replicas=2
+      offsets.topic.replication.factor: 1
+      transaction.state.log.replication.factor: 1
+      transaction.state.log.min.isr: 1
+      default.replication.factor: 1
+      min.insync.replicas: 1
+      auto.create.topics.enable: false
+  entityOperator:
+    topicOperator: {}      # 用 KafkaTopic CR 管理 topic（GitOps 化）
+    userOperator: {}       # 用 KafkaUser CR 管理帳號與 ACL
+---
+apiVersion: kafka.strimzi.io/v1
+kind: KafkaTopic
+metadata:
+  name: k8s-demo
+  labels:
+    strimzi.io/cluster: lab
+spec:
+  partitions: 3
+  replicas: 1              # 正式環境：3
+  config:
+    retention.ms: 86400000

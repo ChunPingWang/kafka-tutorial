@@ -23,3 +23,6 @@ downloads/
 
 # 執行期產生的 pid 檔
 *.pid
+
+# Java 範例的編譯產物
+examples/java/build/
