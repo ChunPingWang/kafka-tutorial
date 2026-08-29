@@ -55,6 +55,7 @@
 - [D. 常見錯誤訊息對照表](#附錄-d常見錯誤訊息對照表)
 - [E. 本手冊的驗證環境](#附錄-e本手冊的驗證環境)
 - [F. VM 佈署實戰：從裸機到通過驗證](#附錄-fvm-佈署實戰從裸機到通過驗證)
+- [G. 情境模擬題庫：排查演練](#附錄-g情境模擬題庫排查演練)
 
 ---
 
@@ -3595,6 +3596,7 @@ Linux 6.18，4 vCPU / 15 GB，Temurin JDK 21，Docker 29 / kind v0.32。
 | 23.4 多位址 bootstrap | 死位址排第一（`dead-host:9092,localhost:19092`）仍成功連線 | ✅ |
 | 28.5 GDPR 抹除 | compacted topic + tombstone：目標 key 個資與 tombstone 皆清除、他人保留 | ✅ |
 | §29.2 Quota | 1MB/s 限速下 40MB 收斂至 1.07MB/s，短跑由 burst 窗口吸收 | ✅ |
+| 附錄 G 模擬題庫 | 8 題中 7 題來自本手冊驗證期間的真實事故；G.3 的 lag 輸出為即時模擬擷取（consumer 停止後 describe） | ✅ |
 
 ### E.2 未實測項目（原因）
 
@@ -3808,6 +3810,262 @@ Ansible 的骨架長這樣（示意；本環境無多機可實測，未附成品
 
 要點只有三個：`serial: 1`（別同時動多台）、cluster.id 當變數統一下發、
 每台裝完立刻 health-check 再進下一台——這三件事把第 17 章的滾動精神帶進佈署。
+
+## 附錄 G：情境模擬題庫：排查演練
+
+讀得懂 runbook 和「凌晨三點被叫醒還能用它」是兩回事——壓力下人只會做練過的事。
+這個題庫把第 19 章的排查方法變成演練材料：每題先只給「你會收到的訊號」，
+**請先蓋住答案、寫下你要下的前三個指令**，再對照排查順序。
+適合自我檢驗、團隊 game day、或面試出題。
+
+八題中有七題不是虛構的：**它們就是本手冊驗證過程中真實發生過的事故**，
+排查輸出都是實際擷取的。共同的起手式永遠是 19.1 的固定順序——
+叢集整體 → quorum → 該元件的 log → 系統資源。
+
+---
+
+### G.1 告警大響：Under-Replicated Partitions 從 0 跳到 124
+
+**收到的訊號**：`KafkaUnderReplicated` 告警觸發；部分 producer 短暫報
+`NOT_LEADER_OR_FOLLOWER` 後恢復；沒有使用者回報寫入失敗。
+
+**先停下來想**：URP 大量出現但寫入還能動，說明什麼？（副本掉了但 leader 都在——
+容錯層被吃掉一層，而不是服務中斷。你有時間，但有限。）
+
+**排查順序**：
+
+```bash
+# 1. 全貌與嚴重度分級（exit 2 = 有 CRIT）
+./scripts/ops/health-check.sh
+# 2. 誰不見了：存活 broker 數 vs 預期
+kafka-broker-api-versions.sh --bootstrap-server $BS | grep -c '(id:'
+# 3. 是行程死了還是機器死了
+systemctl status kafka          # 或 docker ps / 雲平台主機狀態
+# 4. 死因在它自己的 log 裡
+journalctl -u kafka -n 100      # 或 logs/server.log
+```
+
+**根因（實測情境）**：一台 broker 行程消失（實測中是磁碟全毀等級的損壞）。
+
+**修復與預防**：走 19.8 runbook——同 node.id 空磁碟回來會自動重建
+（實測 124 URP → 258 秒追平、資料無損）。預防：這正是 RF=3 存在的理由；
+告警閾值要能區分「單台掉了（警告）」與「持續惡化（緊急）」。
+
+---
+
+### G.2 producer 全面報錯 NOT_ENOUGH_REPLICAS
+
+**收到的訊號**：多個服務同時回報寫入失敗，錯誤都是
+`NotEnoughReplicasException`；讀取完全正常。
+
+**先停下來想**：這個錯誤是誰主動拒絕的？（broker。這不是故障，是
+min.insync.replicas 的保護生效——「寧可停寫也不掉資料」正在按設計運作。
+真正的問題是：為什麼 ISR 湊不齊？）
+
+**排查順序**：
+
+```bash
+# 1. 哪些 partition 湊不齊
+kafka-topics.sh --bootstrap-server $BS --describe --under-min-isr-partitions
+# 2. 缺誰：對照 Replicas 與 Isr 欄位找出落隊的 broker id
+# 3. 那台 broker 怎麼了（回到 G.1 的 3、4 步）
+```
+
+**根因（實測情境）**：RF=3、min.isr=2 的叢集掉了兩台副本（或 min.isr 被誤設為
+等於 RF——實測示範過 min.isr=3 掉一台就停寫）。
+
+**修復與預防**：把落隊 broker 救回來，ISR 恢復寫入立即自癒——**不要**急著調低
+min.isr 或把 acks 改成 1，那是拿資料安全換症狀消失。預防：8.2 的黃金組合，
+min.isr 必須小於 RF。
+
+---
+
+### G.3 consumer lag 持續上漲，業務方問「資料為什麼延遲」
+
+**收到的訊號**：lag 監控持續攀升；下游報表數據停在一小時前。
+
+**先停下來想**：lag 上漲只有三種可能——消費停了、消費太慢、或流量暴增。
+一個 describe 就能分辨大半。
+
+**排查順序**：
+
+```bash
+kafka-consumer-groups.sh --bootstrap-server $BS --describe --group <group>
+```
+
+實測輸出（模擬 consumer 掛掉後流量持續）：
+
+```
+GROUP         TOPIC     PARTITION  CURRENT-OFFSET  LOG-END-OFFSET  LAG   CONSUMER-ID
+lag-demo-svc  lag-demo  0          0               300             300   -
+lag-demo-svc  lag-demo  1          120             500             380   -
+lag-demo-svc  lag-demo  2          0               0               0     -
+```
+
+三個線索一次讀出：**CONSUMER-ID 全是 `-` → 沒有任何活著的 consumer**（服務掛了，
+不是變慢）；CURRENT-OFFSET 有的 0 有的 120 → 掛掉前只消化了部分；
+LOG-END-OFFSET 還在漲 → 上游正常。
+
+- CONSUMER-ID 有值但 lag 仍漲 → 消費太慢：查應用程式的處理耗時，或單一
+  partition lag 特別高 → 可能一筆毒訊息卡住（解法見 25.2 DLQ 模式）
+- 全部正常但 lag 階梯狀跳動 → rebalance 頻繁：查 session.timeout 與部署頻率
+
+**根因（實測情境）**：consumer 行程死亡。
+
+**修復與預防**：重啟服務即從斷點續消費（offset 都在）。預防：consumer 存活監控
+不能只看 lag，要看 group 的成員數。
+
+---
+
+### G.4 broker 重啟後起不來，systemd 顯示 status=226/NAMESPACE
+
+**收到的訊號**：`systemctl start kafka` 秒失敗；journal 只有一行
+`Failed at step NAMESPACE`，Kafka 自己的 log 完全沒有新內容。
+
+**先停下來想**：Kafka log 沒動靜＝行程根本沒起來＝問題在「systemd 到 exec 之間」，
+查 Kafka 設定是白費時間。226/NAMESPACE 專指 mount namespace 建立失敗。
+
+**排查順序**：
+
+```bash
+# 1. 錯誤碼定性：226 = sandbox 設定問題，不是 Kafka 問題
+systemctl status kafka
+# 2. 對照 unit 的 ReadWritePaths / ProtectSystem / ProtectHome，
+#    逐一確認列出的路徑「存在且非 symlink 迷宮」
+systemctl cat kafka | grep -E 'ReadWrite|Protect'
+ls -ld <ReadWritePaths 列的每個路徑>
+```
+
+**根因（本手冊真實案例）**：unit 範本的 `ReadWritePaths` 寫死 `/var/lib/kafka`，
+該路徑不存在 → namespace 建立失敗。同型近親（同樣「行程秒死、Kafka log 空白」）：
+JAAS 條目缺失（`Could not find KafkaServer entry`）、JMX port 被占
+（`Address already in use`）、systemd 環境沒有 java——四種我們都真實踩過，
+共同解法是**先看 journalctl 的第一個錯誤行，再決定要不要打開 Kafka 的 log**。
+
+---
+
+### G.5 「訊息不見了！」——消費端少了 200 筆
+
+**收到的訊號**：業務方對帳發現少資料；producer 端沒有任何錯誤（acks=1）。
+
+**先停下來想**：先問三個問題再動手——(1) 是「還沒到」還是「真的沒了」？
+(2) 這段時間叢集有沒有降級事件？(3) producer 用什麼 acks？
+
+**排查順序**：
+
+```bash
+# 1. 時間軸對齊：訊息「消失」的時段是否與 ISR 事件重疊
+kafka-topics.sh --bootstrap-server $BS --describe --under-replicated-partitions
+# 2. 看 end offset 是否其實有長（資料在，只是 HW 之後不可見）
+kafka-get-offsets.sh --bootstrap-server $BS --topic <topic>
+# 3. 查 consumer 的 auto.offset.reset 與 group offset 是否被重置過
+```
+
+**根因（實測情境）**：ISR 不足期間，acks=1 的訊息已寫進 leader 但 high watermark
+不前進——consumer 讀不到，「看起來」遺失。實測：ISR 恢復後 200 筆全數浮現。
+
+**修復與預防**：**先讓副本追上再判斷**，不要急著重送（會造成重複）。
+如果 ISR 恢復後仍然沒有：檢查是否發生過 unclean election（8.3）——那才是真遺失。
+預防：關鍵資料一律 acks=all + min.isr=2，讓「收到 ack」和「不會消失」劃上等號。
+
+---
+
+### G.6 CDC connector 顯示 RUNNING，但 topic 裡什麼都沒有
+
+**收到的訊號**：Debezium 部署完成、REST API 回報 connector 與 task 都 RUNNING；
+資料庫寫入不斷，Kafka 卻查不到目標 topic。
+
+**先停下來想**：「狀態 RUNNING」只代表行程活著，不代表訊息送得出去。
+訊息出不去的第一嫌疑人永遠是：目標 topic 存在嗎？誰負責建它？
+
+**排查順序**：
+
+```bash
+# 1. 目標 topic 到底存不存在
+kafka-topics.sh --bootstrap-server $BS --list | grep <prefix>
+# 2. 不存在 → 誰該建它？叢集 auto-create 開了嗎（正式環境不該開）
+kafka-configs.sh --bootstrap-server $BS --entity-type brokers --entity-default \
+  --describe --all 2>/dev/null | grep auto.create
+# 3. Connect worker 的 log 找 UnknownTopicOrPartition / 建 topic 失敗
+docker logs cdc-connect | grep -iE 'unknown|topic'
+```
+
+**根因（本手冊真實案例）**：叢集關閉 auto-create（正確），connector 又沒設
+`topic.creation.*` ——事件無 topic 可去。
+
+**修復與預防**：connector 設定加 `topic.creation.enable=true` 與
+`topic.creation.default.partitions/replication.factor`（實測補上後快照與
+增量事件立即到達）。預防：把這三行寫進 CDC 的設定範本（本 repo 的
+docker-compose.cdc.yml 檔頭已內建）。
+
+---
+
+### G.7 效能懸案：p99 延遲 35 秒，但沒有任何錯誤
+
+**收到的訊號**：某個服務的寫入 p99 從 200ms 惡化到 30 秒以上；
+不丟錯誤、不掉訊息；同叢集其他服務完全正常。
+
+**先停下來想**：「只有一個 client 慢、其他都正常」幾乎排除了叢集整體問題
+（磁碟、GC、網路都會雨露均霑）。什麼機制會精準地只懲罰一個 client？
+
+**排查順序**：
+
+```bash
+# 1. 先確認叢集整體無恙（別被單一報案誤導）
+./scripts/ops/health-check.sh
+# 2. 針對該 client：有沒有被設 quota
+kafka-configs.sh --bootstrap-server $BS --describe --entity-type clients \
+  --entity-name <client.id>
+kafka-configs.sh --bootstrap-server $BS --describe --entity-type users \
+  --entity-name <user>
+# 3. broker 端 throttle 指標佐證（produce-throttle-time）
+```
+
+**根因（實測情境）**：client 被設了 `producer_byte_rate=1MB/s`——Kafka 的節流
+是「延後回應」而不是回錯誤，所以症狀是純延遲。實測：40MB 寫入收斂到
+1.07MB/s、p99 35 秒，訊息一筆不少。另一個容易誤判的點：短跑量測看不到節流
+（burst 窗口先吸收），要拉長時間才會現形。
+
+**修復與預防**：和設 quota 的人對齊預期（可能本來就是故意的）；
+14.4 的 quota 清單納入巡檢，讓「誰被限速」可查。
+
+---
+
+### G.8 監控儀表板一片綠，但事故還是發生了
+
+**收到的訊號**：磁碟寫滿導致 broker 停止服務——但 `KafkaDiskFillingUp`
+告警從頭到尾沒響過。事後檢討：為什麼？
+
+**先停下來想**：告警沒響只有三種可能：規則沒載入、表達式永遠為假、
+或指標根本不存在。第三種最陰險——語法完全合法，只是名字是想像的。
+
+**排查順序**：
+
+```bash
+# 1. 規則有沒有真的載入
+docker exec prometheus promtool check rules /etc/prometheus/kafka-alerts.yml
+# 2. 表達式裡的每個指標名，到 exporter 實際輸出裡找得到嗎
+curl -s broker:7071/metrics | grep -c '<指標名>'
+# 3. 在 Prometheus 直接跑該表達式，看回傳是否恆為空
+```
+
+**根因（本手冊真實案例 ×2）**：磁碟告警引用了拿不到的容量數據（Kafka JMX
+根本不知道磁碟多大）；GC 告警寫了不存在的指標名 `jvm_gc_collectiontime`
+（實際是 `jvm_gc_collection_seconds_sum`）。兩者語法都合法、規則都載入、
+永遠不響。
+
+**修復與預防**：每條告警規則上線前做「指標存在性」對照（16.6 的 dashboard
+就是逐一對照過 exporter 輸出才發佈的）；更狠的做法：定期對每條規則做
+「人為觸發演練」——會響的告警才是告警。
+
+---
+
+> **建議用法**：團隊每月抽一題做 15 分鐘 game day——一人主持（只給訊號），
+> 其他人輪流說出下一個指令與理由。所有情境都能在本 repo 的 Docker
+> 練習環境重現（G.1/G.5 用 `resilience-test.sh`、G.3 停掉 consumer 即可、
+> G.6 用 docker-compose.cdc.yml、G.7 設一條 quota）。
+
+---
 
 ## 授權與貢獻
 
