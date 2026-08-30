@@ -411,20 +411,21 @@ rm -rf ~/kafka                   # 完全移除（會刪掉所有資料）
 
 ### 差在哪裡
 
-**以前（Kafka 3.x 以前）：**
+```mermaid
+flowchart LR
+    subgraph old["以前（Kafka 3.x 以前）：兩套系統"]
+        direction TB
+        ZK["ZooKeeper 叢集（3 台）<br>存放 metadata：<br>topic 清單、partition 位置、誰是 leader"]
+        K1["Kafka 叢集（3 台）<br>存放實際訊息"]
+        ZK <--> K1
+    end
+    subgraph new["現在（KRaft）：一套系統"]
+        K2["Kafka 叢集（3 台）<br>metadata 和訊息都在這裡<br>metadata 存在內部 __cluster_metadata topic，<br>用 Raft 在 controller 之間達成共識"]
+    end
+    old -. 少一套要顧 .-> new
 ```
-ZooKeeper 叢集（3 台）  ← 存放 metadata：有哪些 topic、partition 在哪、誰是 leader
-        ↕
-Kafka 叢集（3 台）      ← 存放實際訊息
-```
-要維護兩套分散式系統、兩套監控、兩套備份。
 
-**現在（KRaft）：**
-```
-Kafka 叢集（3 台）  ← metadata 和訊息都在這裡
-                      metadata 存在一個內部的 __cluster_metadata topic，
-                      用 Raft 協議在 controller 之間達成共識
-```
+以前要維護兩套分散式系統、兩套監控、兩套備份。
 
 好處很實際：少一套系統要顧、controller 故障切換從數十秒縮短到秒級、
 支援的 partition 數量大幅提升（百萬級）。
@@ -763,9 +764,17 @@ kafka-3: process.roles=broker,controller   node.id=3
 
 **大型（> 10 節點）—— 角色分離**
 
-```
-controller-1..3: process.roles=controller    ← 小機器就夠（4 核 / 8 GB）
-broker-1..N:     process.roles=broker        ← 大機器
+```mermaid
+flowchart LR
+    subgraph ctl["Controller quorum（小機器就夠：4 核 / 8 GB）"]
+        direction LR
+        c1["controller-1"] --- c2["controller-2"] --- c3["controller-3"]
+    end
+    subgraph brk["Broker（大機器，隨業務擴充）"]
+        direction LR
+        b1["broker-1"] --- b2["broker-2"] --- bN["broker-N"]
+    end
+    brk -- 讀寫 metadata --> ctl
 ```
 好處：controller 不受資料流量影響，metadata 操作更穩定；
 broker 可以隨意增減，不影響 quorum。
@@ -793,13 +802,21 @@ kafka-topics.sh --bootstrap-server $BS --describe --topic my-topic
 
 **推薦：三個 AZ，各放一台**
 
-```
-AZ-A: kafka-1 (broker.rack=az-a)
-AZ-B: kafka-2 (broker.rack=az-b)
-AZ-C: kafka-3 (broker.rack=az-c)
-
-RF=3, min.insync.replicas=2
-→ 整個 AZ 掛掉仍可讀寫
+```mermaid
+flowchart LR
+    subgraph A["AZ-A"]
+        k1["kafka-1<br>broker.rack=az-a"]
+    end
+    subgraph B["AZ-B"]
+        k2["kafka-2<br>broker.rack=az-b"]
+    end
+    subgraph C["AZ-C"]
+        k3["kafka-3<br>broker.rack=az-c"]
+    end
+    k1 <-- 副本同步 --> k2
+    k2 <-- 副本同步 --> k3
+    k1 <-- 副本同步 --> k3
+    note["RF=3 + min.insync.replicas=2<br>→ 整個 AZ 掛掉仍可讀寫"]
 ```
 
 **代價**：跨 AZ 的副本同步會產生流量費用與額外延遲（通常 1–3 ms）。
@@ -1093,12 +1110,17 @@ compaction 保證每個 key 的最新值永遠在，可以用來重建狀態。
 
 ### 8.1 三個旋鈕
 
-```
-┌─ producer 端 ──┐   ┌──── broker 端 ────┐
-│                │   │                    │
-│  acks          │   │ replication.factor │
-│                │   │ min.insync.replicas│
-└────────────────┘   └────────────────────┘
+```mermaid
+flowchart LR
+    subgraph P["producer 端"]
+        acks["acks<br>「等幾個副本確認才算寫入成功」"]
+    end
+    subgraph B["broker / topic 端"]
+        rf["replication.factor<br>「每份資料存幾份」"]
+        isr["min.insync.replicas<br>「至少幾份同步才准寫入」"]
+    end
+    acks -- 三者合力決定：<br>會不會掉資料 --> rf
+    rf --- isr
 ```
 
 **旋鈕 1：`acks`（producer）**
@@ -1711,10 +1733,9 @@ export KAFKA_JVM_PERFORMANCE_OPTS="-server -XX:+UseG1GC -XX:MaxGCPauseMillis=20 
 
 Kafka 的安全性有三層，可以獨立啟用：
 
-```
-① 加密（TLS）      → 資料在網路上不被竊聽
-② 驗證（SASL）     → 確認「你是誰」
-③ 授權（ACL）      → 決定「你能做什麼」
+```mermaid
+flowchart LR
+    t["① 加密（TLS）<br>資料在網路上不被竊聽"] --> s["② 驗證（SASL）<br>確認「你是誰」"] --> a["③ 授權（ACL）<br>決定「你能做什麼」"]
 ```
 
 ### 14.1 啟用 TLS
@@ -3260,10 +3281,11 @@ BOOTSTRAP_SERVERS=localhost:19092 ./run-example.sh <類別名稱>
 卡住整個 partition 無限重試（災難）、跳過（掉資料）、或送去別的 topic 之後前進。
 業界標準是第三種：
 
-```
-orders ──失敗──> orders.retry ──重試 N 次仍失敗──> orders.dlq
-   ↑                  │
-   └── 同一個 consumer 也訂閱 retry topic，帶 x-retry-count header 重新處理
+```mermaid
+flowchart LR
+    O[["orders"]] -- 處理失敗 --> R[["orders.retry"]]
+    R -- "重試 N 次仍失敗" --> D[["orders.dlq<br>（人工 review / 批次重放）"]]
+    R -. "同一個 consumer 也訂閱 retry，<br>帶 x-retry-count header 重新處理" .-> O
 ```
 
 `DlqRetryConsumer.java` 的三個關鍵決定（詳見程式內註解）：
