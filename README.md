@@ -112,6 +112,13 @@
 - 每則訊息都很大（>10MB）→ 應該把大檔放物件儲存，Kafka 只傳連結
 - 訊息量很小（每天幾千筆）而且團隊沒人懂 Kafka → 維運成本遠大於效益，用資料庫表格輪詢就好
 - 需要精確的延遲排程（「30 分鐘後送出」）→ Kafka 沒有延遲佇列
+  - 「延遲佇列」指訊息帶著到期時間、**時間到之前對消費者不可見**
+    （訂單 30 分鐘未付款自動取消、失敗後 5 分鐘才重試）。RabbitMQ、SQS 有內建；
+    Kafka 的訊息一寫入就立刻可見，consumer 又只能循序往下讀，
+    沒有「跳過這筆、等會兒再回來」的機制——這是它為吞吐丟掉逐筆記帳的另一面。
+  - 硬做的代價：consumer 端 sleep 會卡住整個 partition；分層延遲 topic
+    只有粒度沒有精確。正解是**讓排程器（資料庫＋定時任務、Redis）管時間，
+    時間到了才 produce 進 Kafka**——Kafka 只管到期後的事件流。
 
 > **給初學者的誠實建議**：Kafka 很強，但它是一個需要持續維運的分散式系統。
 > 如果你的需求用一張資料庫表格加上定時任務就能解決，那就先那樣做。
@@ -127,24 +134,38 @@
 
 訊息的分類名稱，像資料庫的表格名稱。
 
-```
-訂單系統 ──寫入──> topic: orders
-                      ↓
-              庫存服務、通知服務、報表服務 各自讀取
+```mermaid
+flowchart LR
+    P["訂單系統<br>（producer）"] -- 寫入 --> T[["topic: orders"]]
+    T -- 各自讀取 --> C1["庫存服務"]
+    T -- 各自讀取 --> C2["通知服務"]
+    T -- 各自讀取 --> C3["報表服務"]
 ```
 
 ### 2.2 Partition（分區）—— 最關鍵的概念
 
 一個 topic 會被切成多個 partition。**這是 Kafka 能夠水平擴充的原因。**
 
-```
-topic: orders （3 個 partition）
-
-partition 0: [訂單A] [訂單D] [訂單G] ──> 只保證這條線內的順序
-partition 1: [訂單B] [訂單E] ──────────> 只保證這條線內的順序
-partition 2: [訂單C] [訂單F] [訂單H] ──> 只保證這條線內的順序
-              ↑                    ↑
-            offset 0            offset 2
+```mermaid
+flowchart LR
+    subgraph T["topic: orders（3 個 partition）"]
+        direction TB
+        subgraph p0["partition 0"]
+            direction LR
+            a0["offset 0<br>訂單A"] --> a1["offset 1<br>訂單D"] --> a2["offset 2<br>訂單G"]
+        end
+        subgraph p1["partition 1"]
+            direction LR
+            b0["offset 0<br>訂單B"] --> b1["offset 1<br>訂單E"]
+        end
+        subgraph p2["partition 2"]
+            direction LR
+            c0["offset 0<br>訂單C"] --> c1["offset 1<br>訂單F"] --> c2["offset 2<br>訂單H"]
+        end
+    end
+    p0 -.-> o0["只保證這條線內的順序"]
+    p1 -.-> o1["只保證這條線內的順序"]
+    p2 -.-> o2["只保證這條線內的順序"]
 ```
 
 **三件必須記住的事：**
@@ -167,12 +188,18 @@ partition 2: [訂單C] [訂單F] [訂單H] ──> 只保證這條線內的順�
 Consumer 記住「我讀到第幾號」，這個記錄叫做 **committed offset**，
 存在 Kafka 內部的 `__consumer_offsets` topic 裡。
 
-```
-partition 0: [0][1][2][3][4][5][6][7][8][9]
-                          ↑           ↑
-                    committed      log end
-                     offset=4       offset=10
-                          └── lag = 6 ──┘
+```mermaid
+flowchart LR
+    subgraph p["partition 0"]
+        direction LR
+        n0["0"] --> n1["1"] --> n2["2"] --> n3["3"] --> n4["4"] --> n5["5"] --> n6["6"] --> n7["7"] --> n8["8"] --> n9["9"]
+    end
+    co["committed offset = 4<br>（consumer 的書籤：讀到這裡）"] -.-> n4
+    leo["log end offset = 10<br>（下一筆會寫在這裡）<br>lag = 10 − 4 = 6"] -.-> n9
+    classDef done fill:#2f855a,color:#fff,stroke:none
+    classDef todo fill:#b7791f,color:#fff,stroke:none
+    class n0,n1,n2,n3 done
+    class n4,n5,n6,n7,n8,n9 todo
 ```
 
 **Lag（落後量）= log end offset − committed offset**，
@@ -182,13 +209,15 @@ partition 0: [0][1][2][3][4][5][6][7][8][9]
 
 每個 partition 可以有多個副本，分散在不同 broker 上。
 
-```
-partition 0:  Leader（broker 1） ← 所有讀寫都走這裡
-              Follower（broker 2） ← 持續複製 leader 的資料
-              Follower（broker 3） ← 持續複製 leader 的資料
-
-              ISR (In-Sync Replicas) = {1, 2, 3}
-              「跟上進度的副本集合」
+```mermaid
+flowchart LR
+    C["producer / consumer"] -- 所有讀寫都走 leader --> L
+    subgraph ISR["ISR（In-Sync Replicas）= {1, 2, 3}：跟上進度的副本集合"]
+        direction TB
+        L["Leader<br>（broker 1）"]
+        F2["Follower<br>（broker 2）"] -- 持續拉取複製 --> L
+        F3["Follower<br>（broker 3）"] -- 持續拉取複製 --> L
+    end
 ```
 
 - **Leader**：負責處理該 partition 的所有讀寫
@@ -204,17 +233,25 @@ partition 0:  Leader（broker 1） ← 所有讀寫都走這裡
 
 同一個 group 裡的 consumer **共同分擔**一個 topic 的所有 partition。
 
-```
-topic orders（6 個 partition）
-
-group "inventory-service"（3 個 consumer）
-  consumer-1 ← partition 0, 1
-  consumer-2 ← partition 2, 3
-  consumer-3 ← partition 4, 5
-
-group "analytics-service"（2 個 consumer）   ← 完全獨立的一套進度
-  consumer-A ← partition 0, 1, 2
-  consumer-B ← partition 3, 4, 5
+```mermaid
+flowchart LR
+    subgraph T["topic: orders（6 個 partition）"]
+        direction TB
+        P0["p0"]; P1["p1"]; P2["p2"]; P3["p3"]; P4["p4"]; P5["p5"]
+    end
+    subgraph G1["group inventory-service（分工）"]
+        direction TB
+        C1["consumer-1"]; C2["consumer-2"]; C3["consumer-3"]
+    end
+    subgraph G2["group analytics-service（完全獨立的一套進度）"]
+        direction TB
+        CA["consumer-A"]; CB["consumer-B"]
+    end
+    P0 & P1 --> C1
+    P2 & P3 --> C2
+    P4 & P5 --> C3
+    P0 & P1 & P2 --> CA
+    P3 & P4 & P5 --> CB
 ```
 
 - 同一 group 內：**分工**，每個 partition 只給一個成員
